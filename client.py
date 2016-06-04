@@ -8,8 +8,6 @@ import signal
 import re
 import time
 
-print len(sys.argv)
-
 if len(sys.argv) < 4:
     print sys.argv[0], "RHOST OHOST ip [password]"
     sys.exit()
