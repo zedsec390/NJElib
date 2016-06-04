@@ -220,6 +220,8 @@ class NJE:
 		self.sendData(nje_packet)
 
 		buff   = self.getData()
+                self.msg("Buffer Recieved: Length(%i)", len(buff))
+                if len(buff) < 1: return False
 		#b for buffer
 		bTYPE  = self.EbcdicToAscii(buff[0:8])
 		bRHOST = self.EbcdicToAscii(buff[8:16])
@@ -227,6 +229,7 @@ class NJE:
 		bOHOST = self.EbcdicToAscii(buff[20:28])
 		bOIP   = buff[28:32]
 		bR     = struct.unpack("b", buff[32])[0]
+
 
 		self.msg("Response << TYPE: " + bTYPE + " RHOST: " + bRHOST + " OHOST: " + bRHOST + " R: " + str(bR))
 

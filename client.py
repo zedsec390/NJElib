@@ -26,4 +26,7 @@ else:
 nje = njelib.NJE(sys.argv[1],sys.argv[2])
 nje.set_debuglevel(1)
 t = nje.session(host=sys.argv[3],port=175, timeout=2,password=password)
-nje.dumbClient()
+if t:
+    nje.dumbClient()
+else:
+    print "[!] Error, unable to connect!"
