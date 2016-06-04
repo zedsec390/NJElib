@@ -306,7 +306,6 @@ class NJE:
 			NMRFLAG  = "\x90" #NMRFLAGC Set to 'on'. From IBM "If on, the NMR contains a command"
 			NMRTO    = self.OHOST + self.target_node # This is TO node name and number
 			NMROUT   = chr(0)*8 # was 00:00:00:00:01:00:00:01 but no idea if it needs to be
-			#NMRFM    = self.RHOST + self.own_node
 			NMRFM    = self.RHOST + self.own_node
 			NMRLEVEL = "\x77" # The level, we put it as essential
 			NMRTYPE  = "\x00" # 00 for unformatted commands.
@@ -594,7 +593,7 @@ class NJE:
 
 	def phex(self, stuff):
 		hexed = binascii.hexlify(bytearray(stuff))
-		return ':'.join(hexed[i:i+2] for i in range(0, len(hexed), 2))
+		return ' '.join(hexed[i:i+2] for i in range(0, len(hexed), 2))
 
 	def process_RCB(self):
 		# Record Control Byte  				(Pg 124)
@@ -1382,16 +1381,17 @@ class NJE:
 		return ("\x00\x34\x00\x00") + ("\x00\x30") + ("\x00" * 46)
 
 	def makeSCB(self, buf):
-		''' Implements SCB compression*. Returns a tuple of compressed bytes and
+		''' Implements SCB compression. Returns a tuple of compressed bytes and
 		    the number of bytes remaining in buf. '''
 
-		# *poorly
+        # This version implements compression better than IBM for some reason.
 
 		# String Control Byte 				(Pg 123)
 		# More information available here:
 		# http://www-01.ibm.com/support/knowledgecenter/SSLTBW_2.1.0/com.ibm.zos.v2r1.hasa600/nscb.htm
 
 		self.msg("Compressing %i bytes using \"String Control Byte\" compression", len(buf))
+		self.msg("Raw Message before compression: %s", self.phex(buf))
 
 		#self.msg("Recieved: %r", self.phex(buf))
 		if len(buf) == '': return ''
@@ -1435,9 +1435,9 @@ class NJE:
 
 			buf = buf[1:]
 		if c > 0: d += chr(0xC0 + c) + t
-		#self.msg("Total bytes: %i compressed to %i", processed_bytes, len(d))
+		self.msg("Total bytes: %i compressed to %i", processed_bytes, len(d))
 		#self.msg("Remaining bytes: %i", len(buf))
-		#self.msg(self.phex(d))
+		self.msg("Compressed: %s", self.phex(d))
 		return (d+'\x00', len(buf))
 
 	def compressed(self, RCB_string):
@@ -1530,13 +1530,13 @@ class NJE:
 		else:
 			return message
 
-	def sendJCL(self, file, userid='ibmuser', group='sys1'):
+	def sendJCL(self, filename, userid='ibmuser', group='sys1'):
 		""" sends JCL file as user """
 		self.msg("Processing JCL file")
 
 
 
-		with open (sys.argv[1], "r") as myfile:
+		with open (filename, "r") as myfile:
 		    data=myfile.readlines()
 
 		for i in range(0,len(data)):
