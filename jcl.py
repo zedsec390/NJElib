@@ -11,11 +11,11 @@ import njelib
 import sys
 
 if len(sys.argv) < 6:
-	print 'Usage: ./jcl.py RHOST OHOST ip filname username [password]'
+	print 'Usage: ./jcl.py OHOST RHOST ip filname username [password]'
 	sys.exit(-1)
 	
-print "[+] RHOST:", sys.argv[1]
-print "[+] OHOST:", sys.argv[2]
+print "[+] OHOST:", sys.argv[1]
+print "[+] RHOST:", sys.argv[2]
 print "[+] IP   :", sys.argv[3]
 print "[+] File :", sys.argv[4]
 print "[+] User :", sys.argv[5]
