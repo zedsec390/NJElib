@@ -1,4 +1,5 @@
 import njelib_py3
+import sys
 
 class TSO:
 	# !/usr/bin/python
