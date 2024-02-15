@@ -56,14 +56,14 @@ class c:
         self.BLUE = ''
         self.GREEN = ''
         self.YELLOW = ''
-	self.DARKBLUE = ''
-	self.PURPLE = ''
-	seld.WHITE= ''
+        self.DARKBLUE = ''
+        self.PURPLE = ''
+        self.WHITE= ''
         self.RED = ''
         self.ENDC = ''
 
 def signal_handler(signal, frame):
-        print c.ENDC+ "\n( PACMAN Death Sound )\n"
+        #print(c.ENDC+ "\n( PACMAN Death Sound )\n")
         sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -82,42 +82,37 @@ parser.add_argument('-q','--quiet',help='Do not display the logo',default=False,
 args = parser.parse_args()
 
 if not args.quiet:
-    print c.GREEN+'''        _ '''+c.RED+'''  _   __      __  ______'''+c.GREEN+'''      __
-       (_)'''+c.RED+''' / | / /     / / / ____/'''+c.GREEN+''' ____/ / ____  _____
-      / / '''+c.RED+'''/  |/ / _   / / / __/  '''+c.GREEN+'''/ ___/ __/ __ \/ ___/
-     / / '''+c.RED+'''/ /|  / / /_/ / / /___ '''+c.GREEN+'''/ /__/ /_/ /_/ / /
-    /_/ '''+c.RED+'''/_/ |_/  \____/ /_____/ '''+c.GREEN+'''\___/\__/\____/_/
-         The JES2 NJE Command Injector\n ''' + c.ENDC
+    print("iNJEctor")
 
 
 nje = njelib.NJE(args.ohost,args.rhost)
 
-if not args.quiet: print '[+] Signing on to', args.target,":", args.port
+if not args.quiet: print('[+] Signing on to', args.target,":", args.port)
 
 if args.debug:
-	nje.set_debuglevel(1)
+        nje.set_debuglevel(1)
 
 t = nje.session(host=args.target,port=args.port, timeout=2, password=args.password)
 
 if t:
-	if not args.quiet: print '[+] Signon to', nje.host ,'Complete'
+        if not args.quiet: print('[+] Signon to', nje.host ,'Complete')
 else:
-	print '[!] Signon to', nje.host ,'Failed!\n    Enable debugging to see why.'
-	sys.exit(-1)
+        print('[!] Signon to', nje.host ,'Failed!\n    Enable debugging to see why.')
+        sys.exit(-1)
 
 if not args.msg:
-    if not args.debug and not args.quiet: print "[+] Sending Command:", args.command
+    if not args.debug and not args.quiet: print("[+] Sending Command:", args.command)
     nmr = nje.sendCommand(args.command)
-    if not args.quiet: print "[+] Reply Received:"
-    print "\n", nmr
+    if not args.quiet: print("[+] Reply Received:\n")
+    print(nmr)
 else:
     if not args.debug and not args.quiet:
         if args.user:
-            print "[+] Sending Message (",args.command,") to user: ", args.user
+            print("[+] Sending Message (",args.command,") to user: ", args.user)
         else:
-            print "[+] Sending Message:", args.command
+            print("[+] Sending Message:", args.command)
     if len(args.user) > 0:
         nje.sendMessage(args.command, args.user)
     else:
         nje.sendMessage(args.command)
-    if not args.debug: print "[+] Message sent"
+    if not args.debug: print("[+] Message sent")

@@ -1,1 +1,8 @@
 *.pyc
+*.pcap*
+good_*.txt
+bad_*.txt
+print_sys_path.py
+*.swp
+.vscode
+tmp.py
