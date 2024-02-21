@@ -70,8 +70,8 @@ signal.signal(signal.SIGINT, signal_handler)
 #start argument parser
 parser = argparse.ArgumentParser(description='iNJEctor takes a target host, target NJE hostname and your own NJE hostname and send JES2 commands to the target. Displays the output to stdout.\n See: http://www-01.ibm.com/support/knowledgecenter/SSLTBW_2.1.0/com.ibm.zos.v2r1.hasa200/has2cmdr.htm for a list of commands.')
 parser.add_argument('target',help='The z/OS Mainframe NJE Server IP or Hostname')
-parser.add_argument('ohost',help='Name of the host you\'re sending the control record as. Note that both ohost and rhost must be valid.')
 parser.add_argument('rhost',help='Name of the host you expect to send the command to. Note that both ohost and rhost must be valid.')
+parser.add_argument('ohost',help='Name of the host you\'re sending the control record as. Note that both ohost and rhost must be valid.')
 parser.add_argument('command',help='JES2 or console command or message you wish to send. ')
 parser.add_argument('-p','--port',help='The NJE server port. Default is 175', dest='port', default=175, type=int)
 parser.add_argument('-m','--message',help='Send as message instead of command.',dest='msg',default=False,action='store_true')
@@ -85,7 +85,7 @@ if not args.quiet:
     print("iNJEctor")
 
 
-nje = njelib.NJE(args.ohost,args.rhost)
+nje = njelib.NJE(args.rhost,args.ohost)
 
 if not args.quiet: print('[+] Signing on to', args.target,":", args.port)
 
