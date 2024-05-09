@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3.12
 
 ## NJE NMR Command Sender
 ## Allows for sending commands to z/OS NJE

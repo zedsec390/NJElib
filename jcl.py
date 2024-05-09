@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3.12
 #
 # Executes the JCL provided in the first argument
 # as the user provided as the second argument

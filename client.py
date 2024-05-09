@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3.12
 
 
 import njelib
@@ -25,7 +25,7 @@ else:
 
 nje = njelib.NJE(sys.argv[1],sys.argv[2])
 nje.set_debuglevel(1)
-t = nje.session(host=sys.argv[3],port=3117, timeout=2,password=password)
+t = nje.session(host=sys.argv[3],port=175, timeout=2,password=password)
 if t:
     nje.dumbClient()
 else:
