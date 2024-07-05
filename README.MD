@@ -7,17 +7,18 @@ NJE is known as 'Network Job Entry.' It is used by mainframes all over the world
 The easiest way to explain NJE is using an example. Let's say I'm a super huge mega corporation. I have offices in Washington, DC and New York NY and each have their own mainframe (DC is where we process payroll, New York is where we process insurance claims). Our IT center is headquartered in New York and we don't want to hire more people than we need in DC so we setup NJE with the following in a config (JES2 Parmlib for you pedantics) file:
 
 ```
-NJEDEF   NODENUM=2,
-         OWNNODE=1,
-         LINENUM=1
+ NJEDEF   NODENUM=2,
+          OWNNODE=1,
+          LINENUM=1
 
-NODE(1)  NAME=NEWYORK
-NODE(2)  NAME=WASHDC
+ NODE(1)  NAME=NEWYORK
+ NODE(2)  NAME=WASHDC
 
-NETSRV(1) SOCKET=LOCAL
-LINE(1)  UNIT=TCPIP
-SOCKET(WASHDC) NODE=2,
+ NETSRV(1) SOCKET=LOCAL
+ LINE(1)  UNIT=TCPIP
+ SOCKET(WASHDC) NODE=2,
          IPADDR=33.1.3.37
+
 ```
 
 Then, from NEWYORK, we enable it and connect with these commands:
@@ -46,14 +47,14 @@ $HASP831         TIMETOL=1440
 But being able to issue commands isn't all NJE can do. The most important part is being able to submit jobs and transfer files. Jobs on the mainframe are scripts with input and output directives. To send a job from Washington DC (WASHDC) to New York (NEWYORK) we place an *execution* line (e.g. `/*XEQ NEWYORK`) in the job.
 
 ```
-//H4CKRNJE JOB (1234567),'ABC 123',CLASS=A,
-//             MSGLEVEL=(0,0),MSGCLASS=K,NOTIFY=&SYSUID
-/*XEQ    NEWYORK
-//TSOCMD   EXEC  PGM=IKJEFT01
-//SYSTSPRT DD    SYSOUT=*
-//SYSOUT   DD    SYSOUT=*
-//SYSTSIN  DD    *
-  TIME
+ //H4CKRNJE JOB (1234567),'ABC 123',CLASS=A,
+ //             MSGLEVEL=(0,0),MSGCLASS=K,NOTIFY=&SYSUID
+ /*XEQ    NEWYORK
+ //TSOCMD   EXEC  PGM=IKJEFT01
+ //SYSTSPRT DD    SYSOUT=*
+ //SYSOUT   DD    SYSOUT=*
+ //SYSTSIN  DD    *
+   TIME
 /*
 ```
 
@@ -130,13 +131,30 @@ for record in nje.getSYSOUT():
 ## Offline Analysis
 Using Wireshark you can easily capture NJE records flying across the network. Unfortunately there's currently no formatting available for NJE (future project perhaps). Using this library however, and the raw data extracted from Wireshark you can assess what was sent across the wires. You can use the **set_offline()**
 
-```python
+```
+python
 import njelib
 nje = njelib.NJE()
 nje.set_debuglevel(1)
 nje.set_offline()
 nje.analyze('./wireshark/nje.packet')
 ```
+
+# TLS support with certificates
+There is some support for TLS with certificates.  You need to specify the certificate pem file, the certficate key pem file, and the pem file with the certificate authority certificate.
+
+``python
+import njelib
+import sys
+nje = njelib.NJE("N50","S0W1")
+
+nje.setTLS(certfile="location of certfile.pem",
+           keyfile="location of certfile.key.pem",
+           cafile="location of ca.pem")
+
+connected = nje.session(host="10.1.1.2",port=2252,timeout=1)
+
+``
 
 # What's missing?
 Currently there's no support for XMIT (sending/recieving of dataset) but with the current library as is it shouldn't be too hard to implement.

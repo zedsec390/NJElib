@@ -50,9 +50,26 @@ SYSIN = []
 SYSOUT = []
 NMR = []
 
+def my_to_bytes(a):
+		print("-->my_to_bytes",type(a))
+		if type(a) == int:
+			return a.to_bytes(1,"big")
+		elif type(a) == bytes:
+			return int.to_bytes(a,"big")
+		else:
+			print("->>>my_to_bytes unsupported type",type(a))
+		  
+def my_from_bytes(a):
+		print("--->my_from_bytes",type(a))
+		if type(a) == int:
+			return a.from_bytes(1,"big")
+		elif type(a) == bytes:
+			return int.from_bytes(a,"big")
+		else:
+			print("--->my_from_bytes unsupported type",type(a))
+
 class NJE:
 	def __init__(self, rhost='', ohost='', host='', port=0, password='', rip='127.0.0.1'):
-
 		self.debuglevel = DEBUGLEVEL
 		self.host	= host
 		self.port	= port
@@ -65,6 +82,10 @@ class NJE:
 		self.offline	= False
 		self.server_sec = ''
 		self.FCS	= ''
+		self.cafile = None
+		self.certfile = None 
+		self.keyfile = None 
+		self.certpassword = None
 		#self.OIP	 = socket.inet_aton(host)
 		self.R		= b'\x00'
 		self.node	= 0
@@ -85,19 +106,35 @@ class NJE:
 		self.host = host
 		self.port = port
 		self.timeout = timeout
-		try:
-			self.msg("Trying SSL Connection")
-			non_ssl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			ssl_sock = ssl.wrap_socket(sock=non_ssl,cert_reqs=ssl.CERT_NONE)
-			ssl_sock.settimeout(self.timeout)
-			ssl_sock.connect((host,port))
-			self.sock = ssl_sock
-			self.ssl = True
-		#except ssl.SSLError, e:
-		except Exception as e:
-			non_ssl.close()
-			self.msg("SSL Failed Trying Non-SSL Connection")
+		print("cafile",self.cafile,"certfile",self.certfile,"keystorePassword",self.certpassword)
+		if self.cafile is not None:
 			try:
+			
+				self.msg("Trying SSL Connection")
+				# added by Colin
+				context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+				if self.cafile is not None:
+					context.load_verify_locations(cafile=self.cafile)
+				if self.certfile is not None:
+					context.load_cert_chain(self.certfile,keyfile=self.keyfile,password=self.certpassword)
+				context.verify_mode = ssl.CERT_REQUIRED
+				context.check_hostname = True 
+				non_ssl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				ssl_sock = context.wrap_socket(sock=non_ssl,server_hostname=host)
+				# ssl_sock = ssl.wrap_socket(sock=non_ssl,cert_reqs=ssl.CERT_NONE)
+				ssl_sock.settimeout(self.timeout)
+				ssl_sock.connect((host,port))
+				self.sock = ssl_sock
+				self.ssl = True
+			except Exception as e:
+				print(e)
+				return
+				
+		#except ssl.SSLError, e:
+		if self.ssl is False:
+#		                      self.msg("SSL Failed Trying Non-SSL Connection")
+			try:
+				print("Non SSL")
 				sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 				sock.settimeout(timeout)
 				sock.connect((host,port))
@@ -105,6 +142,11 @@ class NJE:
 			except Exception as e:
 				self.msg("Non-SSL Connection Failed: {0}".format(e))
 				return False
+                #except Exception, e:
+                #       self.msg('SSL Connection Failed Error: %r', e)
+                #       return False
+#			return True
+
 		#except Exception, e:
 		#	self.msg('SSL Connection Failed Error: %r', e)
 		#	return False
@@ -116,6 +158,7 @@ class NJE:
 		sock = self.sock
 		self.sequence = 0x80 #reset sequence
 		self.connected = False
+		# are the following statments in the wong order?
 		self.sock = 0
 		if sock:
 			sock.close()
@@ -123,9 +166,12 @@ class NJE:
 	def signoff(self):
 		#Sends a B Record
 		adios = (b'\x00\x00\x00\x19\x00\x00\x00\x00\x00\x00\x00\x09\x10\x02' +
-				   self.sequence.to_bytes(1) +
+#				   self.sequence.to_bytes(1,"big") +
+				   my_to_bytes(self.sequence) +
 				   b'\x8F\xCF\xF0\xC2\x00\x00\x00\x00\x00\x00' )
-		self.msg("Sending Signoff Record: {0}".format(self.EbcdicToAscii(adios[18])))
+		
+        # The following tries to send an int with value 0 ...! 
+		#self.msg("Sending Signoff Record: {0}".format(self.EbcdicToAscii(adios[18])))
 		self.sendData(adios)
 		self.disconnect()
 
@@ -192,9 +238,11 @@ class NJE:
 			if (type(s) == str):
 				s=bytes(s.encode('EBCDIC-CP-BE'))
 			elif (type(s) == int):
-				s=int.to_bytes(s)
+				#s=s.to_bytes(1,"big")
+				s=my_to_bytes(s)
 			else:
 				print("Cannot convert EbcdicToAscii, Exiting")
+				raise ValueError('Cannot convert EbcdicToAscii, Exiting')
 				sys.exit(-1)
 		''' Converts EBCDIC to UTF-8 '''
 		return s.decode('EBCDIC-CP-BE').encode('ascii')
@@ -309,15 +357,22 @@ class NJE:
 		if not self.connected:
 			return False
 
-		self.msg("Sequence is: " + self.phex(self.sequence.to_bytes(1)))
+#		self.msg("Sequence is: " + self.phex(self.sequence.to_bytes(1,"big")))
+		self.msg("Sequence is: " + self.phex(my_to_bytes(self.sequence)))
 		self.msg("Own Node   : " + self.phex(self.own_node))
 		self.msg("Dest Node  : " + self.phex(self.target_node))
 		self.signed_on = True
 		return True
-
-	def session(self, host, port=175, timeout=30, password=''):
+	def setTLS(self,certfile=None,cafile=None, keyfile=None, password=None):
+		self.cafile = cafile
+		self.certfile  = certfile
+		self.keyfile = keyfile
+		self.certpassword = password
+		return 
+	
+	def session(self, host, port=175,timeout=30, password=''):
 		""" Creates an NJE session by building the connection """
-		if not self.connect(host,port, timeout):
+		if not self.connect(host,port, timeout,):
 			return False
 
 		if not self.initiate():
@@ -346,7 +401,8 @@ class NJE:
 			self.msg("Creating NMR Command")
 			NMRFLAG  = b"\x90" #NMRFLAGC Set to 'on'. From IBM "If on, the NMR contains a command"
 			NMRTO	 = self.OHOST + self.target_node # This is TO node name and number
-			NMROUT	 = (int(0).to_bytes(1) * 8) # was 00:00:00:00:01:00:00:01 but no idea if it needs to be
+#			NMROUT	 = (int(0).to_bytes(1,"big") * 8) # was 00:00:00:00:01:00:00:01 but no idea if it needs to be
+			NMROUT	 = (my_to_bytes(int(0)) * 8) # was 00:00:00:00:01:00:00:01 but no idea if it needs to be
 			NMRFM	 = self.RHOST + self.own_node
 			NMRLEVEL = b"\x77" # The level, we put it as essential
 			NMRTYPE  = b"\x00" # 00 for unformatted commands.
@@ -367,7 +423,8 @@ class NJE:
 			NMRTYPE  = b"\x00" # 00 for unformatted commands.
 
 		NMRMSG	= self.AsciiToEbcdic(message)
-		NMRML	= len(NMRMSG).to_bytes(1)
+#		NMRML	= len(NMRMSG).to_bytes(1,"big")
+		NMRML	= my_to_bytes(len(NMRMSG))
 		NMR_packet =( NMRFLAG + NMRLEVEL + NMRTYPE  + NMRML + NMRTO +
 				  NMROUT + NMRFM + NMRMSG	)
 
@@ -407,7 +464,8 @@ class NJE:
 
 		DS  = b"\x10" + b"\x02" #DLE-STX
 		#BCB  = chr(self.sequence)
-		BCB  = self.sequence.to_bytes(1)
+#		BCB  = self.sequence.to_bytes(1,"big")
+		BCB  = my_to_bytes(self.sequence)
 		FCS  = self.FCS
 		TTR = self.calcTTR(DS + BCB + FCS + nje_record)
 		records = TTR + DS + BCB + FCS + nje_record
@@ -456,7 +514,8 @@ class NJE:
 		nje_record += b"\x00"
 
 		DS  = b"\x10" + b"\x02" #DLE-STX
-		BCB  = self.sequence.to_bytes()
+#		BCB  = self.sequence.to_bytes(1,"big")
+		BCB  = my_to_bytes(self.sequence)
 		FCS  = self.FCS
 		TTR = self.calcTTR(DS + BCB + FCS + nje_record)
 		records = TTR + DS + BCB + FCS + nje_record
@@ -466,7 +525,8 @@ class NJE:
 
 	def sendHeartbeat(self):
 		self.msg("Sending Hearbeat Request Reply")
-		BCB  = self.sequence.to_bytes()
+#		BCB  = self.sequence.to_bytes(1,"big")
+		BCB  = my_to_bytes(self.sequence)
 		self.sendData(b"\x00\x00\x00\x16\x00\x00\x00\x00\x00\x00\x00\x06\x10\x02" +
 					  BCB + self.FCS + b"00\x00\x00\x00\x00")
 		self.INC_SEQUENCE()
@@ -573,6 +633,8 @@ class NJE:
 
 	def sendData(self, data):
 		"""Sends raw data to the NJE server """
+		if self.sock == 0:
+			return  
 		self.msg("Sending  >> '{0}'".format(self.phex(data)))
 		if self.offline:
 			self.msg('Offline Mode: Not Sending data')
@@ -612,8 +674,10 @@ class NJE:
 					current_record = current_record[5:]
 					while len(current_record) > 1:
 						packet_dict = {
-							'RCB' : current_record[0].to_bytes(1),
-							'SRCB' : current_record[1].to_bytes(1)
+							'RCB' : my_to_bytes(current_record[0]),
+#							'RCB' : current_record[0].to_bytes(1,"big"),
+#							'SRCB' : current_record[1].to_bytes(1,"big")
+							'SRCB' : my_to_bytes(current_record[1])
 							}
 						current_record = current_record[2:]
 						if self.compressed(packet_dict['RCB']):
@@ -676,8 +740,10 @@ class NJE:
 
 		for record in self.records:
 
-			self.msg("RCB: '\\x{0:02x}'".format(int.from_bytes(record['RCB'])))
-			self.msg("SRCB: '\\x{0:02x}'".format(int.from_bytes(record['SRCB'])))
+##			self.msg("RCB: '\\x{0:02x}'".format(int.from_bytes(record['RCB'],"big")))
+			self.msg("RCB: '\\x{0:02x}'".format(my_from_bytes(record['RCB'])))
+##			self.msg("SRCB: '\\x{0:02x}'".format(int.from_bytes(record['SRCB'],"big")))
+			self.msg("SRCB: '\\x{0:02x}'".format(my_from_bytes(record['SRCB'])))
 			#self.msg("Record: %r", self.phex(record['Data']))
 	
 			total_len = len(record['RCB']) + len(record['SRCB']) + len(record['Data'])
@@ -1224,6 +1290,7 @@ class NJE:
 	#NMRFLAGJ EQU	B'00000100'		Console not job authorized
 	#NMRFLAGD EQU	B'00000010'		Console not device authorized
 	#NMRFLAGS EQU	B'00000001'		Console not system authorized
+
 		record.update( {
 			'NMRFLAGC' : self.get_bit(record['NMRFLAG'],7),
 			'NMRFLAGW' : self.get_bit(record['NMRFLAG'],6),
@@ -1233,8 +1300,10 @@ class NJE:
 			'NMRFLAGJ' : self.get_bit(record['NMRFLAG'],2),
 			'NMRFLAGD' : self.get_bit(record['NMRFLAG'],1),
 			'NMRFLAGS' : self.get_bit(record['NMRFLAG'],0),
-			'NMRLEVEL' : int.to_bytes(d[1] & 0xF0),
-			'NMRPRIO'  : int.to_bytes(d[1] & 0x0F),
+		#   'NMRLEVEL' : (d[1] & 0xF0). to_bytes(1,"big"), 			
+			'NMRLEVEL' : my_to_bytes(d[1] & 0xF0),
+		#	'NMRPRIO'  : (d[1] & 0x0F).to_bytes(1,"big"),
+			'NMRPRIO'  : my_to_bytes(d[1] & 0x0F),	
 			'NMRTYPE'  : d[2:3],
 				#NMRTYPE
 			#NMRTYPEX EQU	B'11110000'		Reserved bits
@@ -1242,7 +1311,8 @@ class NJE:
 			#NMRTYPEF EQU	B'00000010'		Formatted command in NMRMSG
 			#NMRTYPET EQU	B'00000100'		Msg text only in NMRMSG
 			#NMRTYPE4 EQU	B'00001000'		Msg text contains control info
-			'NMRTYPEX' : int.to_bytes(d[2] & 0xF0),
+			'NMRTYPEX' : my_to_bytes(d[2] & 0xF0),
+		#	'NMRTYPEX' : (d[2] & 0xF0).to_bytes(1,"big"),
 			'NMRTYPED' : self.get_bit(d[2:3], 0),
 			'NMRTYPEF' : self.get_bit(d[2:3], 1),
 			'NMRTYPET' : self.get_bit(d[2:3], 2),
@@ -1329,7 +1399,8 @@ class NJE:
 			if (type(Bbyte) == int):
 				val = Bbyte
 		else:
-			val = int.from_bytes(Bbyte)
+##			val = int.from_bytes(Bbyte,"big")
+			val = my_from_bytes(Bbyte)
 		val = ((val & (1 << i)) !=0)
 		return (val);
 
@@ -1400,7 +1471,8 @@ class NJE:
 		#NJHA		TYPE	 MOD	  OFFS		   FLG1	Reserved
 		acc_header = (b"\x8D" + b"\x00" + b"\x00\x00" + b"\x00" + b"\x08" +
 							#NJHAJLEN						  NJHAJAC1
-						struct.pack(">h",len(acc) + 2) + b"\x01" + len(acc).to_bytes() + self.AsciiToEbcdic(acc) )
+#						struct.pack(">h",len(acc) + 2) + b"\x01" + len(acc).to_bytes(1,"big") + self.AsciiToEbcdic(acc) )
+						struct.pack(">h",len(acc) + 2) + b"\x01" + my_to_bytes(len(acc)) + self.AsciiToEbcdic(acc) )
 		acc_header = struct.pack(">h",len(acc_header) + 2) + acc_header
 
 		# NJHT		   LEN		TYPE	 MOD	LENP	   FLG0	 Reserved
@@ -1471,33 +1543,38 @@ class NJE:
 		while len(buf) > 0 and processed_bytes < 253:
 			if buf[0:1] == ebc_space and buf[1:2] == ebc_space:
 				if c > 0:
-					d += (0xC0 + c).to_bytes() + t # If we go straight from repeat char to repeat spaces this creates an extra char
+#					d += (0xC0 + c).to_bytes(1,"big") + t # If we go straight from repeat char to repeat spaces this creates an extra char
+					d += my_to_bytes(0xC0 + c) + t # If we go straight from repeat char to repeat spaces this creates an extra char
 				t = b''
 				c = 1
 				while c < len(buf) and (buf[c:c+1] == ebc_space and (processed_bytes + c < 253)):
 					if c == 31: 
 						break
 					c += 1
-				d += (0x80 + c).to_bytes()
+#				d += (0x80 + c).to_bytes(1,"big")
+				d += my_to_bytes(0x80 + c)
 				#self.msg("Repeated %r %i times", buf[0], c)
 				buf = buf[c-1:]
 				processed_bytes += c
 				c = 0
 			elif len(buf) > 2 and buf[0:1] == buf[2:3] and buf[0:1] == buf[1:2]:
 				if c > 0: 
-					d += (0xC0 + c).to_bytes() + t # Same as above. This if fixes that
+#					d += (0xC0 + c).to_bytes(1,"big") + t # Same as above. This if fixes that
+					d += my_to_bytes(0xC0 + c) + t # Same as above. This if fixes that
 				t = b''
 				c = 2
 				while c < len(buf) and ( buf[c:c+1] == buf[0:1] and (processed_bytes + c < 253) ):
 					if c == 31: 
 						break
 					c += 1
-				d += (0xA0 + c).to_bytes() + buf[0:1]
+#				d += (0xA0 + c).to_bytes(1,"big") + buf[0:1]
+				d += my_to_bytes(0xA0 + c) + buf[0:1]
 				buf = buf[c-1:]
 				processed_bytes += c
 				c = 0
 			elif c == 63:
-				d += (0xC0 + c).to_bytes() + t
+#				d += (0xC0 + c).to_bytes(1,"big") + t
+				d += my_to_bytes(0xC0 + c) + t
 				t = b''
 				processed_bytes += c
 				c = 0
@@ -1509,7 +1586,8 @@ class NJE:
 			buf = buf[1:]
 			#print(self.phex(d))
 		if c > 0: 
-			d += (0xC0 + c).to_bytes() + t
+#			d += (0xC0 + c).to_bytes(1,"big") + t
+			d += my_to_bytes(0xC0 + c) + t
 		self.msg("Total bytes: {0} compressed to {1}".format(processed_bytes, len(d)))
 		#self.msg("Remaining bytes: %i", len(buf))
 		self.msg("Compressed: {0}".format(self.phex(d)))
@@ -1523,7 +1601,8 @@ class NJE:
 		# sys.exit(-3)
 		#RCB = ord(RCB_string)
 		#RCB = ord(RCB_string)
-		RCB = int.from_bytes(RCB_bytes)
+##		RCB = int.from_bytes(RCB_bytes,"big")
+		RCB = my_from_bytes(RCB_bytes)
 		if (RCB == 0x9A) or ((RCB & 0x0F) == 0x08) or ((RCB & 0x0F) == 0x09):
 			return True
 		else:
@@ -1559,7 +1638,8 @@ class NJE:
 				repeat = False
 				continue
 			#SCB = ord(i)
-			SCB = int.from_bytes(iByte)
+##			SCB = int.from_bytes(iByte,"big")
+			SCB = my_from_bytes(iByte)
 			SCB_type = SCB & 0xC0
 			#self.msg("Current Char: %r, Count: %r, Type: %r", self.phex(i), (SCB & 0x3F), self.phex(chr(SCB_type)))
 			if SCB_type == 0x00:
