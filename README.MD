@@ -143,18 +143,18 @@ nje.analyze('./wireshark/nje.packet')
 # TLS support with certificates
 There is some support for TLS with certificates.  You need to specify the certificate pem file, the certficate key pem file, and the pem file with the certificate authority certificate.
 
-``python
-import njelib
-import sys
-nje = njelib.NJE("N50","S0W1")
+```python
+ import njelib
+ import sys
+ nje = njelib.NJE("N50","S0W1")
 
-nje.setTLS(certfile="location of certfile.pem",
+ nje.setTLS(certfile="location of certfile.pem",
            keyfile="location of certfile.key.pem",
            cafile="location of ca.pem")
 
-connected = nje.session(host="10.1.1.2",port=2252,timeout=1)
+ connected = nje.session(host="10.1.1.2",port=2252,timeout=1)
 
-``
+```
 
 # What's missing?
 Currently there's no support for XMIT (sending/recieving of dataset) but with the current library as is it shouldn't be too hard to implement.
