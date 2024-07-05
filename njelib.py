@@ -51,7 +51,7 @@ SYSOUT = []
 NMR = []
 
 def my_to_bytes(a):
-		print("-->my_to_bytes",type(a))
+		# print("-->my_to_bytes",type(a))
 		if type(a) == int:
 			return a.to_bytes(1,"big")
 		elif type(a) == bytes:
@@ -60,7 +60,7 @@ def my_to_bytes(a):
 			print("->>>my_to_bytes unsupported type",type(a))
 		  
 def my_from_bytes(a):
-		print("--->my_from_bytes",type(a))
+		# print("--->my_from_bytes",type(a))
 		if type(a) == int:
 			return a.from_bytes(1,"big")
 		elif type(a) == bytes:
