@@ -30,6 +30,9 @@
 #
 #########
 
+import atexit
+import os
+import signal
 import socket
 import inspect
 import sys
@@ -38,10 +41,13 @@ import re
 import struct
 import time
 import traceback
+import weakref
+import tempfile
 from select import select
 import binascii
 from binascii import hexlify, unhexlify
 from bitstring import BitStream, BitArray
+import secrets
 
 DEBUGLEVEL = 0
 NJE_PORT = 175
@@ -49,6 +55,69 @@ SPACE = b'\x40'
 SYSIN = []
 SYSOUT = []
 NMR = []
+
+# Optional TLS 1.2 extras for z/OS AT-TLS (used only via addTLSCiphers())
+COMPAT_TLS_CIPHERS = (
+	'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:'
+	'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:'
+	'ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:'
+	'ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:'
+	'AES256-GCM-SHA384:AES128-GCM-SHA256:'
+	'AES256-SHA256:AES128-SHA256:'
+	'DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:'
+	'DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:'
+	'DHE-DSS-AES256-GCM-SHA384:DHE-DSS-AES128-GCM-SHA256:'
+	'DHE-DSS-AES256-SHA256:DHE-DSS-AES128-SHA256:'
+	'@SECLEVEL=1'
+)
+
+# Active sessions cleaned up on interpreter exit / SIGINT / SIGTERM
+_active_sessions = weakref.WeakSet()
+_exit_hooks_installed = False
+
+
+def _cleanup_active_sessions():
+	for nje in list(_active_sessions):
+		try:
+			if (
+				getattr(nje, 'sock', None)
+				or getattr(nje, 'connected', False)
+				or getattr(nje, 'signed_on', False)
+			):
+				nje.disconnect(clean=True)
+		except Exception:
+			pass
+
+
+def _install_exit_hooks():
+	global _exit_hooks_installed
+	if _exit_hooks_installed:
+		return
+	_exit_hooks_installed = True
+	atexit.register(_cleanup_active_sessions)
+
+	def _on_signal(signum, frame):
+		_cleanup_active_sessions()
+		signal.signal(signum, signal.SIG_DFL)
+		os.kill(os.getpid(), signum)
+
+	for sig in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):
+		if sig is None:
+			continue
+		try:
+			signal.signal(sig, _on_signal)
+		except (ValueError, OSError):
+			# Not the main thread, or signals unavailable
+			pass
+
+
+def _register_session(nje):
+	_install_exit_hooks()
+	_active_sessions.add(nje)
+
+
+def _unregister_session(nje):
+	_active_sessions.discard(nje)
 
 def my_to_bytes(a):
 		# print("-->my_to_bytes",type(a))
@@ -69,14 +138,14 @@ def my_from_bytes(a):
 			print("--->my_from_bytes unsupported type",type(a))
 
 class NJE:
-	def __init__(self, rhost='', ohost='', host='', port=0, password='', rip='127.0.0.1'):
+	def __init__(self, rhost='', ohost='', host='', port=0, password='', rip='127.0.0.1', sesskey=None):
 		self.debuglevel = DEBUGLEVEL
 		self.host	= host
 		self.port	= port
 		self.sock	= None
 		self.RHOST	= self.padding(rhost)
 		self.OHOST	= self.padding(ohost)
-		self.TYPE	= self.padding("OPEN")
+		self.TYPE	= self.padding("OPEN")  # setTLS() switches to OPEN SSL
 		self.RIP	= socket.inet_aton(rip)
 		self.connected	= False
 		self.offline	= False
@@ -86,6 +155,11 @@ class NJE:
 		self.certfile = None 
 		self.keyfile = None 
 		self.certpassword = None
+		self.tls_verify = True
+		self.tls_check_hostname = True
+		self.tls_server_hostname = None
+		self.tls_extra_ciphers = None  # set by addTLSCiphers() if needed
+		self.tls_after_open_delay = 0.2
 		#self.OIP	 = socket.inet_aton(host)
 		self.R		= b'\x00'
 		self.node	= 0
@@ -94,86 +168,142 @@ class NJE:
 		self.own_node	= b'\x01' # Node is default 1. Can be changed to anything
 		self.sequence	= 0x80
 		#self.sequence	= b'\x80'
+		self.use_tls_after_open = False  # enabled by setTLS()
+		self.sesskey = sesskey  # APPCLU SESSION SESSKEY (text, 16 hex digits, or 8 raw bytes)
+		self._secure_signon_session_key = (
+			self._normalize_sesskey(sesskey)
+			if sesskey not in (None, '', b'')
+			else None
+		)
+		self.nje_secure_signon = self._secure_signon_session_key is not None
+		self.secure_signon_s1 = None     # Random string sent in I record
+		self.secure_signon_s2 = None     # Random string for secondary validation
+		self.secure_signon_verified = False  # Track if remote verified our s1
+		self.signon_rejected = False
+		self.signon_error = None
+		self._last_connection_event = 0
+		self.signed_on = False
+		self.last_activity = 0.0
+		# RCBs of inbound streams whose EOF has been acknowledged.  This is
+		# also used to distinguish "some SYSOUT arrived" from a fully received
+		# SYSOUT job.
+		self._completed_inbound_streams = []
+		self._inbound_sysout_jobs = {}
+		self._completed_sysout_jobs = []
+		# NJHGJID identifies a job at its originating node.  Do not reuse the
+		# old hard-coded value (49), because more than one NJEUPLD output can be
+		# in flight on different SYSOUT streams.
+		self._next_nje_job_number = secrets.randbelow(32767) + 1
+		# If idle longer than this (seconds), send an NJE heartbeat before next send
+		self.idle_heartbeat = 60.0
 		if host:
 			self.signon(self.host, self.port)
 
 
 	def connect(self, host, port=0, timeout=30):
-		"""Connects to an NJE Server. aka a Mainframe!"""
+		"""Connect TCP. TLS (if enabled) is negotiated later after OPEN/ACK."""
 		self.ssl = False
 		if not port:
 			port = NJE_PORT
 		self.host = host
 		self.port = port
 		self.timeout = timeout
-		print("cafile",self.cafile,"certfile",self.certfile,"keystorePassword",self.certpassword)
-		if self.cafile is not None:
-			try:
-			
-				self.msg("Trying SSL Connection")
-				# added by Colin
-				context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-				if self.cafile is not None:
-					context.load_verify_locations(cafile=self.cafile)
-				if self.certfile is not None:
-					context.load_cert_chain(self.certfile,keyfile=self.keyfile,password=self.certpassword)
-				context.verify_mode = ssl.CERT_REQUIRED
-				context.check_hostname = True 
-				non_ssl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-				ssl_sock = context.wrap_socket(sock=non_ssl,server_hostname=host)
-				# ssl_sock = ssl.wrap_socket(sock=non_ssl,cert_reqs=ssl.CERT_NONE)
-				ssl_sock.settimeout(self.timeout)
-				ssl_sock.connect((host,port))
-				self.sock = ssl_sock
-				self.ssl = True
-			except Exception as e:
-				print(e)
-				return
-				
-		#except ssl.SSLError, e:
-		if self.ssl is False:
-#		                      self.msg("SSL Failed Trying Non-SSL Connection")
-			try:
-				print("Non SSL")
-				sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-				sock.settimeout(timeout)
-				sock.connect((host,port))
-				self.sock = sock
-			except Exception as e:
-				self.msg("Non-SSL Connection Failed: {0}".format(e))
-				return False
-                #except Exception, e:
-                #       self.msg('SSL Connection Failed Error: %r', e)
-                #       return False
-#			return True
+		try:
+			if self.use_tls_after_open:
+				print("Connecting in cleartext (TLS will upgrade after OPEN SSL)")
+			else:
+				print("Connecting (non-TLS)")
+			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			sock.settimeout(timeout)
+			# Help detect dead peers; does not replace NJE-level heartbeats
+			sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+			sock.connect((host, port))
+			self.sock = sock
+			self.last_activity = time.time()
+			return True
+		except Exception as e:
+			self.msg("Plain Connection Failed: {0}".format(e))
+			return False
 
-		#except Exception, e:
-		#	self.msg('SSL Connection Failed Error: %r', e)
-		#	return False
-		return True
-
-	def disconnect(self):
-		"""Close the connection."""
-		self.msg("Disconnecting")
+	def disconnect(self, clean=True):
+		"""Close the connection. With clean=True, send NJE type-B signoff first."""
+		self.msg("Disconnecting (clean={0})".format(clean))
 		sock = self.sock
-		self.sequence = 0x80 #reset sequence
+		do_signoff = (
+			clean
+			and sock
+			and self.connected
+			and getattr(self, 'signed_on', False)
+		)
+
+		if do_signoff:
+			try:
+				self._send_signoff_record()
+			except Exception as e:
+				self.msg("Signoff send failed: {0}".format(e))
+
 		self.connected = False
-		# are the following statments in the wong order?
-		self.sock = 0
-		if sock:
+		self.signed_on = False
+		self.sequence = 0x80
+		self.sock = None
+		_unregister_session(self)
+
+		if not sock:
+			return
+
+		self._close_socket(sock, after_signoff=do_signoff)
+
+	def _close_socket(self, sock, after_signoff=False):
+		"""Close socket; after signoff wait for peer instead of TLS unwrap."""
+		try:
+			sock.settimeout(2.0)
+		except Exception:
+			pass
+
+		if after_signoff:
+			self.msg("Waiting for peer close after NJE signoff")
+			try:
+				while True:
+					chunk = sock.recv(4096)
+					if not chunk:
+						self.msg("Peer closed after signoff")
+						break
+					self.msg("Discarded {0} byte(s) after signoff".format(len(chunk)))
+			except (OSError, ssl.SSLError) as e:
+				self.msg("Peer close after signoff: {0}".format(e))
+			try:
+				sock.close()
+			except OSError:
+				pass
+			return
+
+		if isinstance(sock, ssl.SSLSocket):
+			try:
+				raw = sock.unwrap()
+				self.msg("TLS unwrap OK")
+				sock = raw if raw is not None else sock
+			except Exception as e:
+				self.msg("TLS unwrap failed (continuing close): {0}".format(e))
+
+		try:
+			sock.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+		try:
 			sock.close()
+		except OSError:
+			pass
+
+	def _send_signoff_record(self):
+		"""Send NCCR type B signoff."""
+		self.msg("Sending  >> Signoff Record type: B")
+		if not self.FCS:
+			self.FCS = b"\x8F\xCF"
+		self.sendNJE(b"\xF0", b"\xC2", b"\x00\x00", compress=False)
 
 	def signoff(self):
-		#Sends a B Record
-		adios = (b'\x00\x00\x00\x19\x00\x00\x00\x00\x00\x00\x00\x09\x10\x02' +
-#				   self.sequence.to_bytes(1,"big") +
-				   my_to_bytes(self.sequence) +
-				   b'\x8F\xCF\xF0\xC2\x00\x00\x00\x00\x00\x00' )
-		
-        # The following tries to send an int with value 0 ...! 
-		#self.msg("Sending Signoff Record: {0}".format(self.EbcdicToAscii(adios[18])))
-		self.sendData(adios)
-		self.disconnect()
+		"""Sign off and close cleanly."""
+		self.disconnect(clean=True)
 
 	def set_offline(self):
 		""" Sets the system to offline mode, used for processing
@@ -217,7 +347,8 @@ class NJE:
 
 	def INC_SEQUENCE(self):
 		prev = self.sequence
-		self.sequence = (self.sequence & 0x0F)+1|0x80
+		# BCB sequence is 4 bits under 0x80; must wrap 0x8F -> 0x80 (not 0x90)
+		self.sequence = ((self.sequence & 0x0F) + 1) & 0x0F | 0x80
 		self.msg("Incremented sequence number from {0} to {1}".format(prev, self.sequence))
 
 	def changeNode(self, node):
@@ -275,7 +406,7 @@ class NJE:
 				   - X'03' Link found attempting an active open.
 				   - X'04' (Undocumented) Invalid RHOST with valid OHOST
 		"""
-		self.msg("Initiating Singon to " + self.host + ":" + str(self.port))
+		self.msg("Initiating Signon to " + self.host + ":" + str(self.port))
 
 
 
@@ -333,6 +464,16 @@ class NJE:
 			self.disconnect()
 			return False
 		self.connected = True
+
+		# TLS upgrade after OPEN/ACK when setTLS() was used
+		if self.use_tls_after_open:
+			if self.tls_after_open_delay:
+				time.sleep(self.tls_after_open_delay)
+			if not self.start_tls():
+				self.msg("Failed to upgrade to TLS after OPEN")
+				self.disconnect()
+				return False
+
 		self.send_SOHENQ()
 		buff = self.processData(self.getData())
 
@@ -349,12 +490,18 @@ class NJE:
 		if not self.connected:
 			return False
 
+		self.signon_rejected = False
+		self.signon_error = None
+		self.secure_signon_verified = False
+
 		self.send_I_record()
 		#self.INC_SEQUENCE() # Increment the sequence number by 1 now
 		self.records = self.processData(self.getData())
 		self.process_RCB()
 
-		if not self.connected:
+		if not self.connected or self.signon_rejected:
+			if self.signon_error:
+				self.msg("Signon rejected: {0}".format(self.signon_error))
 			return False
 
 #		self.msg("Sequence is: " + self.phex(self.sequence.to_bytes(1,"big")))
@@ -362,14 +509,99 @@ class NJE:
 		self.msg("Own Node   : " + self.phex(self.own_node))
 		self.msg("Dest Node  : " + self.phex(self.target_node))
 		self.signed_on = True
+		_register_session(self)
 		return True
-	def setTLS(self,certfile=None,cafile=None, keyfile=None, password=None):
+	def setTLS(self, certfile=None, cafile=None, keyfile=None, password=None,
+			   verify=True, check_hostname=True, server_hostname=None,
+			   after_open_delay=None):
+		"""Enable TLS (OPEN SSL + upgrade after OPEN/ACK).
+
+		Uses ssl.create_default_context(). cafile trusts the server cert;
+		certfile/keyfile are optional client certs. Call addTLSCiphers() if the
+		peer needs extra suites beyond the OpenSSL defaults.
+		"""
 		self.cafile = cafile
-		self.certfile  = certfile
+		self.certfile = certfile
 		self.keyfile = keyfile
 		self.certpassword = password
-		return 
-	
+		self.tls_verify = verify
+		self.tls_check_hostname = bool(check_hostname and verify)
+		self.tls_server_hostname = server_hostname
+		if after_open_delay is not None:
+			self.tls_after_open_delay = after_open_delay
+		self.use_tls_after_open = True
+		self.TYPE = self.padding("OPEN SSL")
+		return
+
+	def addTLSCiphers(self, ciphers=None):
+		"""Add extra TLS 1.2 ciphers for mainframe interoperability.
+
+		With no argument, uses COMPAT_TLS_CIPHERS. Pass a colon-separated
+		OpenSSL cipher string to use a custom list instead. Merged with
+		DEFAULT at handshake time (does not replace secure defaults alone).
+		"""
+		self.tls_extra_ciphers = COMPAT_TLS_CIPHERS if ciphers is None else ciphers
+		return self
+
+	def start_tls(self):
+		if self.ssl:
+			return True
+		try:
+			self.msg("Upgrading to TLS...")
+			if not self.sock:
+				raise OSError("no socket to upgrade")
+			try:
+				peer = self.sock.getpeername()
+				self.msg("TCP still connected to {0}".format(peer))
+			except OSError as e:
+				raise OSError("TCP socket not connected before TLS ({0})".format(e))
+
+			if self.tls_verify:
+				context = ssl.create_default_context(cafile=self.cafile)
+				context.check_hostname = self.tls_check_hostname
+			else:
+				context = ssl.create_default_context()
+				context.check_hostname = False
+				context.verify_mode = ssl.CERT_NONE
+
+			if self.tls_extra_ciphers:
+				try:
+					# Keep DEFAULT suites, prepend/append extras for AT-TLS peers
+					context.set_ciphers(self.tls_extra_ciphers + ':DEFAULT')
+					self.msg("Using extra TLS ciphers plus DEFAULT")
+				except ssl.SSLError as e:
+					self.msg("Extra ciphers rejected ({0}); keeping defaults".format(e))
+
+			if self.certfile:
+				self.msg("Loading client certificate: {0}".format(self.certfile))
+				context.load_cert_chain(
+					self.certfile,
+					keyfile=self.keyfile,
+					password=self.certpassword,
+				)
+
+			server_hostname = self.tls_server_hostname or self.host
+			self.sock = context.wrap_socket(
+				self.sock,
+				server_hostname=server_hostname if server_hostname else None,
+				do_handshake_on_connect=False,
+			)
+
+			self.msg("Starting TLS handshake (server_hostname={0!r})".format(server_hostname))
+			self.sock.do_handshake()
+			self.ssl = True
+			try:
+				self.msg("TLS upgrade successful: {0} {1}".format(
+					self.sock.version(), self.sock.cipher()))
+			except Exception:
+				self.msg("TLS upgrade successful")
+			return True
+		except Exception as e:
+			self.msg("TLS Upgrade Failed: {0}".format(e))
+			if self.debuglevel > 0:
+				traceback.print_exc()
+			return False
+
 	def session(self, host, port=175,timeout=30, password=''):
 		""" Creates an NJE session by building the connection """
 		if not self.connect(host,port, timeout,):
@@ -524,11 +756,14 @@ class NJE:
 		self.msg("Sent {0} NJE Records".format(len(records)))
 
 	def sendHeartbeat(self):
-		self.msg("Sending Hearbeat Request Reply")
-#		BCB  = self.sequence.to_bytes(1,"big")
-		BCB  = my_to_bytes(self.sequence)
-		self.sendData(b"\x00\x00\x00\x16\x00\x00\x00\x00\x00\x00\x00\x06\x10\x02" +
-					  BCB + self.FCS + b"00\x00\x00\x00\x00")
+		"""Reply to a peer keep-alive (TTR length 6: DLE STX BCB FCS 00)."""
+		self.msg("Sending Heartbeat Reply")
+		if not self.FCS:
+			self.FCS = b"\x8F\xCF"
+		BCB = my_to_bytes(self.sequence)
+		# Must be null bytes — b"00" is ASCII '0' (0x30) and poisons the link
+		record = b"\x10\x02" + BCB + self.FCS + b"\x00"
+		self.sendData(self.makeTTB(self.makeTTR(record)))
 		self.INC_SEQUENCE()
 
 	def check_signoff(self, buf):
@@ -550,23 +785,30 @@ class NJE:
 		self.sendData(with_TTB)
 
 	def send_I_record(self):
-		''' Creates Initial Signon Record 'I' '''
-		# From Page 111 in has2a620.pdf
+		'''Creates Initial Signon Record 'I' (see HAS2A620).'''
 		self.FCS = b"\x8F\xCF"
+		LEN = b"\x29"
 		NCCRCB = b"\xF0" # Control Record
 		NCCSRCB = b"\xC9" # EBCDIC letter 'I'
-		LEN = b"\x29" # LENGTH OF RECORD
 		NCCIEVNT = b"\x00" * 4
 		NCCIREST = b"\x00\x64" # Node Resistance
 		BUFSIZE = b"\x80\x00" # Buffer Size. Set to: 32768
 		PASSWORD = self.padding(self.password)*2
-		NCCIFLG = b"\x00" # 0 for initial signon
-		NCCIFEAT = b"\x15\x00\x00\x00"
-		# print(type(self.RHOST))
-		# print(type(self.own_node))
-		# sys.exit(3333)
-		p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
-		self.msg("Sending  >> Initial Signon Record type: I")
+		# x'40' = NJE secure signon (SESSKEY), not TLS
+		NCCIFLG = b"\x40" if self.nje_secure_signon else b"\x00"
+		NCCIFEAT = b"\x40\x17\x00\x00"
+		
+		if self.nje_secure_signon:
+			# Generate random 8-byte string s1 for secure signon
+			self.secure_signon_s1 = self._generate_random_8bytes()
+			#self.secure_signon_s1 = bytes.fromhex(b'0000000000000000')
+			self.msg("Secure signon: sending s1 = {0}".format(hexlify(self.secure_signon_s1)))
+			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + self.secure_signon_s1 + self.secure_signon_s1 + NCCIFLG + NCCIFEAT
+		else:
+			# Regular signon, record length is 0x29 (41 bytes)
+			p = LEN + self.RHOST + self.own_node + NCCIEVNT + NCCIREST + BUFSIZE + PASSWORD + NCCIFLG + NCCIFEAT
+		
+		self.msg("Sending  >> Initial Signon Record type: I (secure={0})".format(self.nje_secure_signon))
 		self.sendNJE(NCCRCB, NCCSRCB, p)
 
 	def padding(self, word):
@@ -574,6 +816,197 @@ class NJE:
 		pad=(SPACE * (8-len(word)))
 		x=self.AsciiToEbcdic(word.upper())
 		return(x+pad)
+
+	def _normalize_sesskey(self, sesskey):
+		"""Return the APPCLU SESSION SESSKEY as exactly eight raw bytes.
+
+		Accepted forms:
+		  * bytes/bytearray of length 8: already-encoded raw key bytes
+		  * 16 hexadecimal digits: for example D7C1E2E2E6D9C4F1
+		  * up to 8 text characters: uppercased, encoded as EBCDIC, zero padded
+		"""
+		if isinstance(sesskey, (bytes, bytearray, memoryview)):
+			raw = bytes(sesskey)
+			if len(raw) == 8:
+				return raw
+			try:
+				text = raw.decode('ascii')
+			except UnicodeDecodeError as exc:
+				raise ValueError(
+					"sesskey bytes must be exactly 8 raw bytes or ASCII hex/text"
+				) from exc
+		elif isinstance(sesskey, str):
+			text = sesskey
+		else:
+			raise TypeError(
+				"sesskey must be text, 16 hexadecimal digits, or 8 raw bytes"
+			)
+
+		text = text.strip()
+		hex_text = text[2:] if text.lower().startswith('0x') else text
+		hex_text = re.sub(r'[\s:_-]', '', hex_text)
+		if len(hex_text) == 16 and re.fullmatch(r'[0-9A-Fa-f]{16}', hex_text):
+			return bytes.fromhex(hex_text)
+
+		try:
+			ascii_text = text.upper().encode('ascii')
+		except UnicodeEncodeError as exc:
+			raise ValueError("text sesskey must contain ASCII characters") from exc
+		if len(ascii_text) > 8:
+			raise ValueError(
+				"text sesskey is longer than 8 characters; pass 16 hex digits for raw bytes"
+			)
+
+		# JES2 initializes MDCTIKEY to binary zeros before copying the
+		# extracted SESSKEY.  A short text key therefore has X'00' bytes,
+		# not EBCDIC blanks, in the unused right-hand positions.
+		return self.AsciiToEbcdic(ascii_text) + (b"\x00" * (8 - len(ascii_text)))
+
+	@staticmethod
+	def _racf_des_key_from_challenge(challenge):
+		"""Apply RACF's DES authentication-key transformation.
+
+		For each challenge byte RACF XORs with X'55', shifts left one bit,
+		and uses bit 7 as the odd DES parity bit.
+		"""
+		challenge = bytes(challenge)
+		if len(challenge) != 8:
+			raise ValueError(
+				"NJE secure-signon challenge must be exactly 8 bytes, got {0}".format(
+					len(challenge)
+				)
+			)
+
+		key = bytearray(8)
+		for index, value in enumerate(challenge):
+			key_byte = ((value ^ 0x55) << 1) & 0xFE
+			# Set the low-order bit when needed so the byte has odd parity.
+			if bin(key_byte).count('1') % 2 == 0:
+				key_byte |= 0x01
+			key[index] = key_byte
+		return bytes(key)
+
+	@staticmethod
+	def _des_encrypt_block(key, plaintext):
+		"""Encrypt one eight-byte block with single DES in ECB mode."""
+		key = bytes(key)
+		plaintext = bytes(plaintext)
+		if len(key) != 8 or len(plaintext) != 8:
+			raise ValueError("DES key and plaintext must each be exactly 8 bytes")
+
+		try:
+			from Crypto.Cipher import DES
+		except ImportError:
+			# An 8-byte TripleDES key repeats K1 for all three operations, so
+			# E(K1,D(K1,E(K1,P))) reduces to ordinary single-DES E(K1,P).
+			try:
+				from cryptography.hazmat.primitives.ciphers import Cipher, modes
+				try:
+					from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+				except ImportError:
+					from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
+			except ImportError as exc:
+				raise RuntimeError(
+					"Secure NJE signon requires pycryptodome or cryptography"
+				) from exc
+
+			encryptor = Cipher(TripleDES(key), modes.ECB()).encryptor()
+			return encryptor.update(plaintext) + encryptor.finalize()
+
+		cipher = DES.new(key, DES.MODE_ECB)
+		return cipher.encrypt(plaintext)
+
+	def _racf_secure_signon_encrypt(self, challenge):
+		"""Produce NCCIPENC exactly as JES2's RACROUTE TYPE=ENCRYPT does.
+
+		The challenge is transformed into the DES key.  The APPCLU SESSKEY
+		is the eight-byte plaintext block.  This is intentionally the reverse
+		of DES(key=SESSKEY, plaintext=challenge).
+		"""
+		if self._secure_signon_session_key is None:
+			raise ValueError("secure signon requested without an APPCLU SESSKEY")
+
+		racf_des_key = self._racf_des_key_from_challenge(challenge)
+		self.msg(
+			"Secure signon: RACF DES key derived from challenge = {0}".format(
+				hexlify(racf_des_key)
+			)
+		)
+		return self._des_encrypt_block(
+			racf_des_key, self._secure_signon_session_key
+		)
+
+	@staticmethod
+	def _current_zos_connection_event():
+		"""Return the high-order word of the current z/OS TOD clock.
+
+		JES2 connection-event sequence values are derived from STCKF. The
+		TOD clock counts 2**-12 microseconds since 1900-01-01. JES2 uses
+		the first fullword of that value as its four-byte CES.
+		"""
+		nanoseconds_since_1900 = time.time_ns() + (2208988800 * 1000000000)
+		tod_clock = (nanoseconds_since_1900 * 4096) // 1000
+		return (tod_clock >> 32) & 0xFFFFFFFF
+
+	def _next_connection_event(self, remote_event=b"\x00\x00\x00\x00"):
+		"""Generate a JES2-compatible connection-event sequence.
+
+		This follows JES2's NPEVENT logic: advance beyond the largest prior
+		CES, but do not use a value older than roughly 60 TOD high-word ticks
+		or later than the current TOD clock.
+		"""
+		if len(remote_event) != 4:
+			raise ValueError("connection-event sequence must be exactly 4 bytes")
+
+		remote_value = int.from_bytes(remote_event, "big")
+		current_value = self._current_zos_connection_event()
+		oldest_allowed = max(0, current_value - 60)
+		candidate = max(remote_value, self._last_connection_event) + 1
+		if candidate < oldest_allowed:
+			candidate = oldest_allowed
+		if candidate > current_value:
+			raise ValueError(
+				"cannot generate a valid CES: previous value is later than current TOD"
+			)
+
+		self._last_connection_event = candidate
+		return candidate.to_bytes(4, "big")
+
+	def _derive_des_key(self, password):
+		"""Derive an 8-byte DES key from sesskey or password (z/OS uses single DES)."""
+		# Reuse the canonical SESSKEY normalization.  In particular, short
+		# SESSKEY values are right-padded with X'00', matching JES2.
+		if self._secure_signon_session_key is not None:
+			return self._secure_signon_session_key
+		
+		# Ordinary NJE password fields remain EBCDIC-blank padded.
+		pwd_str = password if isinstance(password, str) else password.decode('ascii')
+		pwd_ebcdic = self.AsciiToEbcdic(pwd_str.upper())
+		pwd_8bytes = pwd_ebcdic + (SPACE * (8 - len(pwd_ebcdic)))
+		return pwd_8bytes[:8]
+
+	def _des3_encrypt(self, plaintext, key=None):
+		"""Encrypt plaintext using DES ECB mode"""
+		if key is None:
+			key = self._derive_des_key(self.password)
+		# Use only first 8 bytes for single DES (z/OS uses single DES for secure signon)
+		from Crypto.Cipher import DES
+		cipher = DES.new(key[:8], DES.MODE_ECB)
+		return cipher.encrypt(plaintext)
+
+	def _des3_decrypt(self, ciphertext, key=None):
+		"""Decrypt ciphertext using DES ECB mode"""
+		if key is None:
+			key = self._derive_des_key(self.password)
+		# Use only first 8 bytes for single DES (z/OS uses single DES for secure signon)
+		from Crypto.Cipher import DES
+		cipher = DES.new(key[:8], DES.MODE_ECB)
+		return cipher.decrypt(ciphertext)
+
+	def _generate_random_8bytes(self):
+		"""Generate a random 8-byte string for secure signon"""
+		return secrets.token_bytes(8)
+
 
 	def hsize(self, b_array):
 		return struct.unpack('>H', b_array)[0]
@@ -609,37 +1042,119 @@ class NJE:
 		''' returns an int of the length '''
 		return self.hsize(TTR[2:4])
 
-	def getData(self):
+	def getData(self, timeout=None):
+		"""Read available data without blocking until peer close.
+
+		timeout: seconds to wait for first byte (default: self.timeout).
+		"""
 		if self.offline:
 			self.msg('Offline Mode: Not Retrieving data')
-			return
-		data = b''
-		r, w, e = select([self.sock], [], [])
-		for i in r:
-			try:
-				buf = self.sock.recv(256)
-				data += buf
+			return b''
+		if not self.sock:
+			self.msg('getData: no socket')
+			return b''
 
-				while( buf != b''):
-					buf = self.sock.recv(256)
-					data += buf
-				if(buf == b''):
-					break
+		data = b''
+		if timeout is None:
+			timeout = getattr(self, 'timeout', 30) or 30
+		try:
+			r, _, _ = select([self.sock], [], [], timeout)
+		except (TypeError, ValueError) as e:
+			self.msg("getData select failed: {0}".format(e))
+			return b''
+		if not r:
+			self.msg("Recieved << '' (timeout waiting for data)")
+			return b''
+
+		try:
+			buf = self.sock.recv(4096)
+		except socket.error as e:
+			self.msg("getData recv failed: {0}".format(e))
+			self.connected = False
+			self.signed_on = False
+			return b''
+		if buf == b'':
+			self.msg("Recieved << '' (peer closed)")
+			self.connected = False
+			self.signed_on = False
+			return b''
+		data += buf
+
+		# Drain only data already queued
+		while True:
+			try:
+				r, _, _ = select([self.sock], [], [], 0)
+			except (TypeError, ValueError):
+				break
+			if not r:
+				break
+			try:
+				buf = self.sock.recv(4096)
 			except socket.error:
-				# traceback.print_exc()
-				pass
+				break
+			if buf == b'':
+				self.connected = False
+				self.signed_on = False
+				break
+			data += buf
+
+		self.last_activity = time.time()
 		self.msg("Recieved << '{0}'".format(self.phex(data)))
 		return data
 
+	def _process_inbound(self, timeout=None):
+		"""Read one batch and run process_RCB. Returns True if any data arrived."""
+		data = self.getData(timeout=timeout)
+		if not data:
+			return False
+		self.records = self.processData(data)
+		self.process_RCB()
+		return True
+
+	def _drain_inbound(self, idle=0.15, max_rounds=20):
+		"""Process any pending inbound NJE until the socket is quiet."""
+		for _ in range(max_rounds):
+			if not self.connected or not self.sock:
+				break
+			if not self._process_inbound(timeout=idle):
+				break
+
+	def _ensure_session(self):
+		"""Drain inbound traffic and send a heartbeat if the link was idle."""
+		if not self.sock or not self.connected or not self.signed_on:
+			return False
+		self._drain_inbound()
+		if not self.connected:
+			return False
+		idle = time.time() - (self.last_activity or 0)
+		if self.idle_heartbeat and idle >= self.idle_heartbeat:
+			self.msg("Idle {0:.0f}s; sending NJE heartbeat".format(idle))
+			try:
+				self.sendHeartbeat()
+				self._drain_inbound(idle=0.5, max_rounds=10)
+			except Exception as e:
+				self.msg("Heartbeat failed: {0}".format(e))
+				self.connected = False
+				self.signed_on = False
+				return False
+		return bool(self.connected and self.sock)
+
 	def sendData(self, data):
 		"""Sends raw data to the NJE server """
-		if self.sock == 0:
-			return  
+		if not self.sock:
+			return
 		self.msg("Sending  >> '{0}'".format(self.phex(data)))
 		if self.offline:
 			self.msg('Offline Mode: Not Sending data')
 			return
-		self.sock.sendall(data)
+		try:
+			self.sock.sendall(data)
+			self.last_activity = time.time()
+		except OSError as e:
+			self.msg("sendData failed: {0}".format(e))
+			self.connected = False
+			self.signed_on = False
+			raise
 
 	def processData(self, data):
 		"""Process Data Streams returns an array """
@@ -769,7 +1284,7 @@ class NJE:
 
 			if RCB == 0x00:
 				self.msg("End-of-block (BSC) (00)")
-				return "EOB"
+				continue
 			elif RCB == 0x90:
 				self.msg("Type: Request to initiate stream (90)")
 				record['stream'] = record['SRCB']
@@ -778,13 +1293,19 @@ class NJE:
 				RCB = b"\xA0"
 				SRCB = record['stream']
 				self.sendNJE(RCB, SRCB, b"\x00\x00")
-				return
+				continue
 			elif RCB == 0xA0:
 				self.msg("Type: Permission to initiate stream (A0)")
 				record['streaming'] = True
 
 			elif RCB == 0xB0:
+				# Stream-level cancel/deny (SRCB = stream), not full session death
 				self.msg("Type: Negative permission or receiver cancel (B0)")
+				if not self.signed_on:
+					self.signon_rejected = True
+					self.signon_error = "negative response B0, SRCB=X'{0:02X}'".format(
+						my_from_bytes(record['SRCB'])
+					)
 			elif RCB == 0xC0:
 				self.msg("Type: Acknowledge transmission complete (C0)")
 			elif RCB == 0xD0:
@@ -805,12 +1326,55 @@ class NJE:
 				NMR.append(data)
 			elif (RCB & 0x0F) == 0x08:
 				self.msg("Type: SYSIN record (98-F8)")
+				if record['SRCB'] == b"\x00":
+					self._acknowledge_stream_eof(record['RCB'])
+					continue
 				data = self.process_SYSIN(record)
 				SYSIN.append(data)
 			elif (RCB & 0x0F) == 0x09:
 				self.msg("Type: SYSOUT record (99-F9)")
+				if record['SRCB'] == b"\x00":
+					self._acknowledge_stream_eof(record['RCB'])
+					continue
 				data = self.process_SYSOUT(record)
 				SYSOUT.append(data)
+				if data and 'NJHGJID' in data:
+					self._inbound_sysout_jobs[record['RCB']] = data
+
+	def _acknowledge_stream_eof(self, stream_rcb):
+		"""Acknowledge a received SYSIN/SYSOUT EOF and close that stream."""
+		self.msg(
+			"End of stream X'{0:02X}'; sending transmission complete".format(
+				my_from_bytes(stream_rcb)
+			)
+		)
+		# For a stream-control record, SRCB identifies the completed stream.
+		self.sendNJE(b"\xC0", stream_rcb, b"\x00\x00")
+		self._completed_inbound_streams.append(stream_rcb)
+		if (my_from_bytes(stream_rcb) & 0x0F) == 0x09:
+			self._completed_sysout_jobs.append(
+				self._inbound_sysout_jobs.pop(stream_rcb, None)
+			)
+
+	def _completed_sysout_count(self):
+		"""Return the number of inbound SYSOUT streams acknowledged so far."""
+		return sum(
+			1 for stream in self._completed_inbound_streams
+			if (my_from_bytes(stream) & 0x0F) == 0x09
+		)
+
+	def _sysout_job_completed_since(self, job_number, job_name, start_index):
+		"""Return true when the selected NJE job has reached SYSOUT EOF."""
+		expected_name = str(job_name).strip().upper()
+		for job in self._completed_sysout_jobs[start_index:]:
+			if not job or job.get('NJHGJID') != job_number:
+				continue
+			actual_name = job.get('NJHGJNAM', b'')
+			if isinstance(actual_name, bytes):
+				actual_name = actual_name.decode('ascii', errors='replace')
+			if actual_name.strip().upper() == expected_name:
+				return True
+		return False
 
 	def process_NCCR(self, record):
 		""" Networking Connection Control Records (NCCR)
@@ -836,17 +1400,55 @@ class NJE:
 			record['NCCIEVNT'] = record['Data'][10:14]
 			record['NCCIREST'] = record['Data'][14:16]
 			record['NCCIBUFSZ'] = record['Data'][16:18]
-			record['NCCILPAS'] = self.EbcdicToAscii(record['Data'][18:26])
-			record['NCCINPAS'] = self.EbcdicToAscii(record['Data'][26:34])
-			#record['NCCIPRAW'] = record['Data'][28:32]
-			#record['NCCIPENC'] = record['Data'][32:40]
-			record['NCCIFLG'] = record['Data'][34]
-			record['NCCIFEAT'] = record['Data'][45:]
+			
+			# Handle secure vs regular signon fields
+			if self.nje_secure_signon:
+				self.msg("Processing secure signon response (J record)")
+				# In secure signon mode:
+				# Data[18:26]: NCCIPRAW (s2 from remote)
+				# Data[26:34]: NCCIPENC (encrypted s1 from remote)
+				record['NCCIPRAW'] = record['Data'][18:26]
+				record['NCCIPENC'] = record['Data'][26:34]
+				self.msg("Secure signon: received s2 = {0}".format(hexlify(record['NCCIPRAW'])))
+				self.msg("Secure signon: received e_s1 = {0}".format(hexlify(record['NCCIPENC'])))
+				
+				# Verify remote encrypted our s1 correctly
+				try:
+					my_encrypted_s1 = self._racf_secure_signon_encrypt(self.secure_signon_s1)
+					if my_encrypted_s1 == record['NCCIPENC']:
+						self.msg("Secure signon: s1 verification SUCCESS")
+						self.secure_signon_verified = True
+					else:
+						self.msg("Secure signon: s1 verification FAILED - remote response doesn't match")
+						self.msg("Expected: {0}".format(hexlify(my_encrypted_s1)))
+						self.msg("Got: {0}".format(hexlify(record['NCCIPENC'])))
+						self.signon_rejected = True
+						self.signon_error = "remote failed secure-signon s1 verification"
+				except Exception as e:
+					self.msg("Secure signon: s1 verification ERROR - {0}".format(e))
+					self.signon_rejected = True
+					self.signon_error = "secure-signon s1 verification error: {0}".format(e)
+				
+				# Store s2 for later verification in K/L record
+				self.secure_signon_s2 = record['NCCIPRAW']
+				record['NCCIFLG'] = record['Data'][34]
+			else:
+				# Regular signon mode - use password fields
+				record['NCCILPAS'] = self.EbcdicToAscii(record['Data'][18:26])
+				record['NCCINPAS'] = self.EbcdicToAscii(record['Data'][26:34])
+				record['NCCIFLG'] = record['Data'][34]
+			
+			# NCCIDL includes RCB and SRCB.  The four feature bytes occupy
+			# Data[35:39]; bytes beyond the declared length are SCB framing.
+			record['NCCIFEAT'] = record['Data'][35:39] if record['Data'][0] >= 0x29 else b''
 			self.target_node = record['NCCIQUAL']
 			record['Data'] = ''
+			if self.signon_rejected:
+				return
+
 			if record['NCCIEVNT'] == b"\x00\x00\x00\x00":
 				# Reset the connection with type K
-				self.send_reset() #Type 'K'
+				self.send_reset(record['NCCIEVNT']) #Type 'K'
 				self.records = self.processData(self.getData())
 				self.process_RCB()
 			else:
@@ -856,8 +1458,37 @@ class NJE:
 
 		elif SRCB == "K":
 			self.msg("[NCCR] K - Reset signon")
+			if self.nje_secure_signon and len(record['Data']) >= 15 and record['Data'][0] >= 0x11:
+				# K/L secure layout in Data is DL(1), EVNT(4), REST(2), PENC(8).
+				# Do not use [-8:] because processData may retain SCB terminators.
+				received_e_s2 = record['Data'][7:15]
+				try:
+					my_encrypted_s2 = self._racf_secure_signon_encrypt(self.secure_signon_s2) if self.secure_signon_s2 else None
+					if my_encrypted_s2 and my_encrypted_s2 == received_e_s2:
+						self.msg("Secure signon: s2 verification SUCCESS")
+					else:
+						self.msg("Secure signon: s2 verification FAILED")
+						if my_encrypted_s2:
+							self.msg("Expected: {0}".format(hexlify(my_encrypted_s2)))
+							self.msg("Got: {0}".format(hexlify(received_e_s2)))
+				except Exception as e:
+					self.msg("Secure signon: s2 verification ERROR - {0}".format(e))
 		elif SRCB == "L":
 			self.msg("[NCCR] L - Concurrence signon")
+			if self.nje_secure_signon and len(record['Data']) >= 15 and record['Data'][0] >= 0x11:
+				# Same secure layout as K.
+				received_e_s2 = record['Data'][7:15]
+				try:
+					my_encrypted_s2 = self._racf_secure_signon_encrypt(self.secure_signon_s2) if self.secure_signon_s2 else None
+					if my_encrypted_s2 and my_encrypted_s2 == received_e_s2:
+						self.msg("Secure signon: s2 verification SUCCESS")
+					else:
+						self.msg("Secure signon: s2 verification FAILED")
+						if my_encrypted_s2:
+							self.msg("Expected: {0}".format(hexlify(my_encrypted_s2)))
+							self.msg("Got: {0}".format(hexlify(received_e_s2)))
+				except Exception as e:
+					self.msg("Secure signon: s2 verification ERROR - {0}".format(e))
 		elif SRCB == "M":
 			self.msg("[NCCR] M - Add connection")
 		elif SRCB == "N":
@@ -865,27 +1496,64 @@ class NJE:
 		elif SRCB == "B":
 			self.msg("[NCCR] B - Signoff")
 			self.msg("Recieved Signoff Record of type 'B'. Closing Connection")
-			self.disconnect()
+			self.signed_on = False
+			self.disconnect(clean=False)
 
-	def send_reset(self):
+	def send_reset(self, previous_event=b"\x00\x00\x00\x00"):
 		''' Builds Reset Signon Record '''
 		RCB = b"\xF0"	 #NCCRCB type 0xF0
 		SRCB = b"\xD2"	  #SRCB = 'K'
-		LEN = b"\x09"
-		reset = LEN + b"\xFF\xFF\xFF\xFF" + b"\x00\xC8" + b"\x00\x00\x00\x00"
+		NCCIEVNT = self._next_connection_event(previous_event)
+		NCCIREST = b"\x00\xC8"
+
+		if self.nje_secure_signon and self.secure_signon_s2:
+			# Secure K is exactly 17 bytes including RCB/SRCB:
+			#   F0 D2 11 EVNT(4) REST(2) PENC(8)
+			try:
+				encrypted_s2 = self._racf_secure_signon_encrypt(self.secure_signon_s2)
+				self.msg("Secure signon: sending e_s2 = {0}".format(hexlify(encrypted_s2)))
+				reset = b"\x11" + NCCIEVNT + NCCIREST + encrypted_s2
+			except Exception as e:
+				self.msg("Secure signon: failed to encrypt s2 - {0}".format(e))
+				self.signon_rejected = True
+				self.signon_error = "failed to encrypt secure-signon s2: {0}".format(e)
+				return False
+		else:
+			# Non-secure K is exactly 9 bytes including RCB/SRCB.
+			reset = b"\x09" + NCCIEVNT + NCCIREST
+
+		if len(reset) + 2 != reset[0]:
+			raise AssertionError("invalid K-record length")
+		self.msg("Reset CES = {0}".format(hexlify(NCCIEVNT)))
 		self.msg("Sending  >> Reset Signon Record type: K")
 		self.sendNJE(RCB, SRCB, reset)
-		#self.sendData(self.makeTTB(self.makeTTR_dbh(reset_signon)))
+		return True
 
 	def send_concurrence(self, NCCIEVNT):
 		''' Builds concurrence Signon Record '''
 		RCB = b"\xF0"	 #NCCRCB type 0xF0
 		SRCB = b"\xD3"	  #SRCB = 'L'
-		LEN = b"\x09"
-		con = LEN + NCCIEVNT + b"\x00\xC8"
+		NCCIREST = b"\x00\xC8"
+
+		if self.nje_secure_signon and self.secure_signon_s2:
+			# Secure L has the same 17-byte layout as secure K.
+			try:
+				encrypted_s2 = self._racf_secure_signon_encrypt(self.secure_signon_s2)
+				self.msg("Secure signon: sending e_s2 = {0}".format(hexlify(encrypted_s2)))
+				con = b"\x11" + NCCIEVNT + NCCIREST + encrypted_s2
+			except Exception as e:
+				self.msg("Secure signon: failed to encrypt s2 - {0}".format(e))
+				self.signon_rejected = True
+				self.signon_error = "failed to encrypt secure-signon s2: {0}".format(e)
+				return False
+		else:
+			con = b"\x09" + NCCIEVNT + NCCIREST
+
+		if len(con) + 2 != con[0]:
+			raise AssertionError("invalid L-record length")
 		self.msg("Sending  >> Accept (concurrence) network SIGNON Record type: L")
 		self.sendNJE(RCB, SRCB, con)
-		#self.sendData(self.makeTTB(self.makeTTR_dbh(concurrent_signon)))
+		return True
 
 	def request_stream(self):
 		""" Requests to initiate an NJE stream """
@@ -1410,9 +2078,19 @@ class NJE:
 			ip += str(struct.unpack('<B', ip_addr[i])[0])+"."
 		return ip[:-1]
 
-	def makeSYSIN_header(self, lines, jobnum, programmer, job_class, msg_class, job_name, acc, userid="ibmuser", group="sys1", passw=''):
+	def makeSYSIN_header(self, lines, jobnum, programmer, job_class, msg_class, job_name, acc, userid="ibmuser", group=None, passw=''):
 		""" Creates the necesary sections of the job headers for the NJE record """
 
+		userid = str(userid).strip().upper()
+		group = '' if group is None else str(group).strip().upper()
+		if not re.fullmatch(r"[A-Z0-9@#$]{1,8}", userid):
+			raise ValueError("userid must be 1-8 valid RACF name characters")
+		if group and not re.fullmatch(r"[A-Z0-9@#$]{1,8}", group):
+			raise ValueError("group must be 1-8 valid RACF name characters")
+
+		NJHTSUSR = self.padding(userid)
+		NJHTSNOD = self.RHOST
+		NJHTSGRP = self.padding(group)
 		NJHTOUSR = self.padding(userid)
 		NJHTOGRP = self.padding(group)
 
@@ -1475,22 +2153,28 @@ class NJE:
 						struct.pack(">h",len(acc) + 2) + b"\x01" + my_to_bytes(len(acc)) + self.AsciiToEbcdic(acc) )
 		acc_header = struct.pack(">h",len(acc_header) + 2) + acc_header
 
-		# NJHT		   LEN		TYPE	 MOD	LENP	   FLG0	 Reserved
-		sec_prefix = (b"\x00\x58" + b"\x8C" + b"\x00" + b"\x00\x04" + b"\x00" + b"\x00") #00:58:8c:00:00:04:00
-		# NJHT		   LENT	VERS	 FLG1	  STYP
-		sec_subsec = (b"\x50" + b"\x01" + b"\x32" + b"\x07" )
-		# Here's the important stuff the next byte is NJHTFLG2 with to important bits:
-		#	0x80: if not set it means that we (this script) confirmed the security was all good
-		#	0x08: If set, it means the user is a 'trusted' user
-		#sec_subsec += b"\x08"
-		sec_subsec += b"\x00"
+		# NJHTF0JB is off: this section describes the submitting identity.
+		# RACF can propagate that identity into the job owner according to the
+		# receiving node's NODES USERJ/GROUPJ profiles.
+		sec_prefix = (
+			b"\x00\x58" + b"\x8C" + b"\x00" + b"\x00\x04"
+			+ b"\x00" + b"\x00"
+		)
+		# External NJE format (0x40), originating without RACF (0x20), and
+		# batch-job security session type (0x07).
+		sec_subsec = b"\x50\x01\x60\x07"
+		# This client authenticates the NJE node, not the individual RACF user.
+		# Mark the supplied identity as default/unverified (0x80) and remotely
+		# originated (0x02); the receiving RACF policy decides whether it may be
+		# propagated, translated, or rejected.
+		sec_subsec += b"\x82"
 		# NJHT		POEX	  RESRVD	SECL		 CNOD	   SUSR + SNOD + SGRP
-		sec_subsec += (b"\x03" + b"\xC0\x00" + (b"\x00" * 8) + self.RHOST + (b"\x00" * 24) +
+		sec_subsec += (b"\x03" + b"\xC0\x00" + (b"\x00" * 8) + self.RHOST +
+					   NJHTSUSR + NJHTSNOD + NJHTSGRP +
 					   #POEN	   RESRVD
 					   self.padding("INTRDR") + (b"\x00" * 8) )
-		# Here's the next important parts: NJHTOUSR and NJHTOGRP
-		# Using these two fields we can specify any userid and group we want.
-		# The default is IBMUSER and SYS1.
+		# Owner fields mirror the submitting identity. They are assertions only;
+		# they do not bypass RACF validation or NODES-class policy.
 		self.msg("Setting Target User/Group: {0}/{1}".format(userid.upper(), group.upper()))
 		sec_subsec += NJHTOUSR + NJHTOGRP
 		sec_header = sec_prefix + sec_subsec
@@ -1680,29 +2364,64 @@ class NJE:
 		self.msg(msg)
 		msg = self.sendNMR(message, False, user)
 		time.sleep(5)
-		self.signoff()
+#		self.signoff()
 
-	def sendCommand(self, command):
-		""" uses 'command' to create a node message record (NMR) and sends it """
+	def sendCommand(self, command, clear=True, wait=5.0):
+		"""Send an operator command (NMR) and return the reply text.
+
+		clear=True (default) drops previous NMR replies so only this command's
+		responses are returned. Pass clear=False to keep and include history.
+		wait: seconds to collect replies (multi-packet responses).
+
+		If the session sat idle, a heartbeat is sent first (see idle_heartbeat).
+		Long idle links are often dropped by JES2/AT-TLS/TCP — reconnect if
+		this returns False with a dead session.
+		"""
 		self.msg("Sending command: {0}".format(command))
-		self.sendNMR(command, True)
-		self.records = self.processData(self.getData())
-		self.process_RCB()
+		if not self._ensure_session():
+			self.msg("Session not alive (idle timeout or peer closed); reconnect")
+			return False
+		if clear:
+			NMR.clear()
+		try:
+			self.sendNMR(command, True)
+		except OSError as e:
+			self.msg("sendCommand send failed: {0}".format(e))
+			return False
+
+		# Collect replies; keep draining briefly after the first NMR arrives
+		# so multi-line console output is not left sitting for the next call.
+		deadline = time.time() + wait
+		got_reply = False
+		while time.time() < deadline:
+			if not self.connected:
+				break
+			timeout = min(0.5, max(0.05, deadline - time.time()))
+			if not self._process_inbound(timeout=timeout):
+				if got_reply:
+					break
+				continue
+			if NMR:
+				got_reply = True
+				# short quiet period for trailing lines, then stop
+				self._drain_inbound(idle=0.25, max_rounds=5)
+				break
+
 		message = ''
 		for record in self.getNMR():
 			for i in record:
 				self.msg("record[{0}]: {1}".format(i, record[i]))
 			if 'NMRMSG' in record:
 				message += record['NMRMSG'].decode('ascii') + "\n"
-		self.signoff()
 		if len(message) <= 0:
 			return False
 		else:
 			return message
 
-	def sendJCL(self, filename, userid='ibmuser', group='sys1'):
-		""" sends JCL file as user """
+	def sendJCL(self, filename, userid='ibmuser', group=None, wait_for_sysout=True):
+		"""Send a JCL file, optionally waiting for a complete SYSOUT stream."""
 		self.msg("Processing JCL file")
+		completed_jobs_before = len(self._completed_sysout_jobs)
 
 		with open (filename, "r") as myfile:
 			data=myfile.readlines()
@@ -1730,9 +2449,14 @@ class NJE:
 		self.msg("Group: {0}".format(group))
 
 		jcl = []
-		jcl.append(data[0].strip("\n") + " " * (72 - len(data[0].strip("\n"))) + "JOB00049" )
+		num = self._next_nje_job_number
+		self._next_nje_job_number = 1 if num >= 32767 else num + 1
+		jcl.append(
+			data[0].strip("\n")
+			+ " " * (72 - len(data[0].strip("\n")))
+			+ "JOB{0:05d}".format(num)
+		)
 		jcl += data[1:]
-		num = int(jcl[0][-5:])
 		self.msg("Job Number: {0}".format(num))
 		jcl_class = "A"
 		msg_class = "K"
@@ -1756,10 +2480,164 @@ class NJE:
 		self.records = self.processData(self.getData())
 		self.process_RCB()
 
-		while len(self.getSYSOUT()) <= 0:
-			self.records = self.processData(self.getData())
-			self.process_RCB()
-		self.signoff()
+		if wait_for_sysout:
+			while not self._sysout_job_completed_since(
+				num, job, completed_jobs_before
+			):
+				self.records = self.processData(self.getData())
+				self.process_RCB()
+				if not self.connected:
+					raise ConnectionError(
+						"NJE peer disconnected while waiting for complete SYSOUT"
+					)
+#		self.signoff()
+
+	def upload_text(self, local_path, dataset, userid='ibmuser', group=None,
+			create=False, recfm='FB', lrecl=80, blksize=0,
+			primary=5, secondary=5, unit='SYSDA', long_lines='error',
+			wait_for_sysout=True):
+		"""Upload an ASCII text file through NJE using an IEBGENER job.
+
+		The destination may be an existing sequential data set or an existing
+		PDS/PDSE member.  Set create=True to allocate a new sequential data set.
+		If group is omitted, RACF may select the propagated user's default group.
+		Existing sendJCL() callers retain their original wait-for-SYSOUT behavior.
+		"""
+		dataset = str(dataset).strip().upper()
+		dsn_pattern = (
+			r"[A-Z@#$][A-Z0-9@#$-]{0,7}"
+			r"(?:\.[A-Z@#$][A-Z0-9@#$-]{0,7})*"
+		)
+		member_match = re.fullmatch(
+			r"(" + dsn_pattern + r")\(([A-Z@#$][A-Z0-9@#$]{0,7})\)",
+			dataset
+		)
+		if member_match:
+			base_dsn = member_match.group(1)
+		else:
+			base_dsn = dataset
+		if not re.fullmatch(dsn_pattern, base_dsn):
+			raise ValueError("invalid z/OS data set name: {0}".format(dataset))
+		if len(base_dsn) > 44:
+			raise ValueError("z/OS data set name exceeds 44 characters")
+		if create and member_match:
+			raise ValueError("create=True only supports a sequential data set")
+
+		recfm = str(recfm).upper()
+		if recfm not in ('F', 'FB'):
+			raise ValueError("upload_text currently supports RECFM F or FB")
+		if not isinstance(lrecl, int) or not 1 <= lrecl <= 80:
+			raise ValueError("lrecl must be between 1 and 80")
+		if long_lines not in ('error', 'wrap', 'truncate'):
+			raise ValueError("long_lines must be 'error', 'wrap', or 'truncate'")
+
+		with open(local_path, 'r', encoding='ascii', newline=None) as source:
+			source_lines = source.read().splitlines()
+
+		data_lines = []
+		for line_number, line in enumerate(source_lines, 1):
+			if len(line) <= lrecl:
+				data_lines.append(line)
+			elif long_lines == 'truncate':
+				data_lines.append(line[:lrecl])
+			elif long_lines == 'wrap':
+				data_lines.extend(
+					line[offset:offset + lrecl]
+					for offset in range(0, len(line), lrecl)
+				)
+			else:
+				raise ValueError(
+					"line {0} is {1} characters; LRECL is {2}".format(
+						line_number, len(line), lrecl
+					)
+				)
+
+		# DLM must be exactly two characters.  Select one that cannot be
+		# mistaken for a data record in this particular input file.
+		data_set = set(data_lines)
+		delimiter = None
+		for first in 'ZQXWVUTSRPONMLKJIHGFEDCBA':
+			for second in 'ZQXWVUTSRPONMLKJIHGFEDCBA0123456789':
+				candidate = first + second
+				if candidate not in data_set:
+					delimiter = candidate
+					break
+			if delimiter:
+				break
+		if delimiter is None:
+			raise ValueError("could not select a safe two-character JCL delimiter")
+
+		jcl_lines = [
+			"//NJEUPLD JOB (NJE),'NJELIB',CLASS=A,MSGCLASS=H",
+			"//COPY     EXEC PGM=IEBGENER",
+			"//SYSPRINT DD SYSOUT=*",
+		]
+		if create:
+			for name, value in (
+				('primary', primary), ('secondary', secondary),
+				('blksize', blksize)
+			):
+				if not isinstance(value, int) or value < 0:
+					raise ValueError("{0} must be a non-negative integer".format(name))
+			if primary == 0:
+				raise ValueError("primary must be greater than zero")
+			unit = str(unit).strip().upper()
+			if not re.fullmatch(r"[A-Z0-9@#$]{1,8}", unit):
+				raise ValueError("invalid UNIT value")
+			jcl_lines.extend([
+				"//SYSUT2   DD DSN={0},".format(dataset),
+				"//            DISP=(NEW,CATLG,DELETE),UNIT={0},".format(unit),
+				"//            SPACE=(TRK,({0},{1})),".format(primary, secondary),
+				"//            DCB=(RECFM={0},LRECL={1},BLKSIZE={2})".format(
+					recfm, lrecl, blksize
+				),
+			])
+		else:
+			jcl_lines.append("//SYSUT2   DD DSN={0},DISP=OLD".format(dataset))
+
+		jcl_lines.extend([
+			"//SYSIN    DD DUMMY",
+			"//SYSUT1   DD DATA,DLM={0}".format(delimiter),
+		])
+		jcl_lines.extend(data_lines)
+		jcl_lines.append(delimiter)
+
+		for line_number, line in enumerate(jcl_lines, 1):
+			if len(line) > 80:
+				raise ValueError(
+					"generated JCL record {0} exceeds 80 columns: {1}".format(
+						line_number, line
+					)
+				)
+
+		temp_name = None
+		try:
+			with tempfile.NamedTemporaryFile(
+				mode='w', encoding='ascii', newline='\n',
+				prefix='njelib-upload-', suffix='.jcl', delete=False
+			) as temp_jcl:
+				temp_name = temp_jcl.name
+				for line in jcl_lines:
+					temp_jcl.write(line + '\n')
+			self.sendJCL(
+				temp_name, userid=userid, group=group,
+				wait_for_sysout=wait_for_sysout
+			)
+		finally:
+			if temp_name:
+				try:
+					os.unlink(temp_name)
+				except OSError:
+					pass
+
+		return {
+			'dataset': dataset,
+			'records': len(data_lines),
+			'lrecl': lrecl,
+			'recfm': recfm,
+			'created': bool(create),
+			'wait_for_sysout': bool(wait_for_sysout),
+		}
 
 	def dumbClient(self):
 		""" Connects to an NJE server and does nothing """

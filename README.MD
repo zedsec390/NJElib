@@ -64,48 +64,64 @@ When we run this job (aka submit it to be processed) JES2 will read the `/*XEQ` 
 Finally, using XMIT you can also transfer files between two systems. So if you have a library on the development system you want to move to production you could use XMIT in stead of FTP. Keep in mind, however, that if SSL isn't turned on you'll be sending this data in clear text (hint hint PCI assessors).
 
 ## Local Nodes
-Once a system is declared in NJE and connected it still won't be able to submit jobs between one system and another. There's so many different ways to declare NJE to your security product that I'm only going to focus on the concept of local nodes in RACF. In RACF you declare nodes to be trusted and any jobs coming from that system will be treated as though they came from the local system (user permission wise). This is because the userid is assumed to be validated at the node its coming from. Read the comments in the `makeSYSIN_header()` function to see what this is and what's important. Specifically the `NJHTFLG2`, `NJHTOUSR` and `NJHTOGRP` header items.
+
+Connecting two NJE nodes does not by itself authorize jobs or propagated user identities. On a RACF-protected receiver, `NODES` class profiles determine whether an incoming user and group are accepted, translated, or rejected. The security headers produced by `makeSYSIN_header()` identify the remote submitting user and group as assertions; they do not prove that the individual user authenticated. Configure node trust and identity propagation according to your site's security policy. NJE secure signon, described below, authenticates the peer node with an APPCLU session key.
 
 # Using this Library
-This library connects to a mainframe serving up NJE and pretends to be mainframe. NJE runs on port 175 or 2252(ssl) and (generally) runs over TCPIP. To use NJE all you need are the **OHOST** and **RHOST** names.
+
+This library connects to a mainframe serving up NJE and pretends to be a mainframe. NJE generally runs over TCP/IP; port 175 is commonly used for cleartext NJE, while a site-defined port such as 2252 may be protected by TLS. To use NJE you need the **OHOST** and **RHOST** names.
+
 * **OHOST**: Target System node name (could be hostname but not always). In our examples, NEWYORK is the OHOST.
 * **RHOST**: The system we're pretending to be. In these examples WASHDC is the RHOST.
 
 First we create an NJE object:
+
 ```python
 import njelib
-nje = njelib.NJE("WASHDC","NEWYORK")
+nje = njelib.NJE("WASHDC", "NEWYORK")
 ```
+
 Now we need to connect to a mainframe:
+
 ```python
-connected = nje.session(host="3.1.33.7",port=175)
+connected = nje.session(host="3.1.33.7", port=175)
 
 if not connected:
-   print "That didn't work"
-   return
+    raise SystemExit("That didn't work")
 ```
-the `session()` function will return `True` if the connection is successful and `False` if it failed for any reason. This script tries to initiate an SSL connection first and falls back to unencrypted if that fails.
+
+The `session()` function returns `True` if the connection and NJE signon succeed, and `False` otherwise. A session is cleartext unless `setTLS()` is called before `session()`; TLS failure does not silently fall back to cleartext.
 
 Notice that this library is silent unless you turn on debugging with:
+
 ```python
 nje.set_debuglevel(1)
 ```
-Once we're connected we can issue commands, send messages and/or submit JCL:
-```python
-#send a command
-Reply = nje.sendCommand(args.command)
-print Reply
 
-#send a message to someone
+Once we're connected we can issue commands, send messages and/or submit JCL:
+
+```python
+# Send a command. Replies may contain multiple lines.
+reply = nje.sendCommand("$D NJEDEF", wait=5.0)
+print(reply)
+
+# Send a message to someone.
 nje.sendMessage("MESS WITH THE BEST DIE LIKE THE REST", "plague")
 
-#send a message to the master console
+# Send a message to the master console.
 nje.sendMessage("ARF ARF")
 
-#send a JCL file as a specific user
-nje.sendJCL("cookie.jcl", "plague")
+# Send a JCL file as a specific user and wait for its complete SYSOUT stream.
+nje.sendJCL("cookie.jcl", userid="plague")
+
+# Send an NJE type-B signoff and close TLS/TCP cleanly.
+nje.disconnect()
 ```
-when you submit JCL/commands you'll get messages (aka NMR) and/or SYSOUT (job output) back. To access that information you can access dictionaries which collect all the headers, footers etc as described in the NJE documentation through a handful of functions:
+
+`sendCommand()` keeps the session open, clears old NMR replies by default, and collects multi-packet replies for up to `wait` seconds. Pass `clear=False` to retain earlier NMRs. Long-idle sessions get an NJE heartbeat before the next command; reconnect if `sendCommand()` returns `False` because the peer has already dropped the link.
+
+When you submit JCL/commands you'll get messages (aka NMR) and/or SYSOUT (job output) back. To access that information you can access dictionaries which collect all the headers, footers etc as described in the NJE documentation through a handful of functions:
+
 * `getNMR()` - returns a list of dictionaries with message headers and message contents
 * `getSYSIN()` - returns a list of dictionaries with job/dataset headers/footers and dataset contents
 * `getSYSOUT()` - returns a list of dictionaries with job/dataset headers/footers and dataset contents
@@ -116,23 +132,24 @@ nje.sendJCL("cookie.jcl", "plague")
 #Print any messages
 for record in nje.getNMR():
    if 'NMRUSER' in record:
-      print "[+] User Message"
-      print "[+] To User:", record['NMRUSER']
-      print "[+] Message:", record['NMRMSG']
+      print("[+] User Message")
+      print("[+] To User:", record['NMRUSER'])
+      print("[+] Message:", record['NMRMSG'])
    elif 'NMRMSG' in record :
-      print "[+] Message:", record['NMRMSG']
+      print("[+] Message:", record['NMRMSG'])
 
 #Prints any data we've received
-print "[+] Records in SYSOUT:"
+print("[+] Records in SYSOUT:")
 for record in nje.getSYSOUT():
     if 'Record' in record:
-        print record['Record']
+        print(record['Record'])
 ```
-## Offline Analysis
+
+### Offline Analysis
+
 Using Wireshark you can easily capture NJE records flying across the network. Unfortunately there's currently no formatting available for NJE (future project perhaps). Using this library however, and the raw data extracted from Wireshark you can assess what was sent across the wires. You can use the **set_offline()**
 
-```
-python
+```python
 import njelib
 nje = njelib.NJE()
 nje.set_debuglevel(1)
@@ -140,24 +157,109 @@ nje.set_offline()
 nje.analyze('./wireshark/nje.packet')
 ```
 
-# TLS support with certificates
-There is some support for TLS with certificates.  You need to specify the certificate pem file, the certficate key pem file, and the pem file with the certificate authority certificate.
+# TLS and AT-TLS
+
+TLS is enabled explicitly with `setTLS()` before `session()`. The initial `OPEN SSL` exchange is cleartext, as required by application-controlled AT-TLS; the library upgrades the socket only after JES2 acknowledges the open. The negotiated TLS version comes from the Python/OpenSSL runtime and the peer, so TLS 1.3 is used when both support it and can otherwise negotiate a supported TLS 1.2 configuration.
+
+For normal server-authenticated TLS, provide the CA that issued the z/OS server certificate. The hostname used for the connection must match the certificate. Use `server_hostname` when connecting by IP address or by a name different from the certificate's DNS name:
 
 ```python
- import njelib
- import sys
- nje = njelib.NJE("N50","S0W1")
+import njelib
 
- nje.setTLS(certfile="location of certfile.pem",
-           keyfile="location of certfile.key.pem",
-           cafile="location of ca.pem")
+nje = njelib.NJE("N50", "S0W1")
+nje.setTLS(
+    cafile="certificates/ca.pem",
+    server_hostname="zos.example.com",
+)
 
- connected = nje.session(host="10.1.1.2",port=2252,timeout=1)
-
+connected = nje.session(host="10.1.1.2", port=2252, timeout=10)
 ```
 
+If the AT-TLS policy requires client authentication, also supply the client certificate and key:
+
+```python
+nje.setTLS(
+    cafile="certificates/ca.pem",
+    certfile="certificates/client.pem",
+    keyfile="certificates/client-key.pem",
+    password="private-key-password",
+    server_hostname="zos.example.com",
+)
+```
+
+Verification and hostname checks are on by default. `verify=False` is available for isolated troubleshooting but should not be used in production. If an older TLS 1.2 peer has no cipher in common with the OpenSSL defaults, call `nje.addTLSCiphers()` before `session()`, or pass a colon-separated OpenSSL cipher string to that method. TLS 1.3 cipher selection is handled by OpenSSL and is not changed by `addTLSCiphers()`.
+
+The included [`pagttls.conf`](pagttls.conf) is a sample Policy Agent configuration for inbound and outbound JES2 traffic with application-controlled AT-TLS and TLS 1.2/1.3 enabled. Before installing it, update the keyring, ports, addresses, cipher suites, and trace settings for your system. The inbound rule must treat JES2/AT-TLS as the TLS server (`HandshakeRole Server`) and must have `ApplicationControlled On`.
+
+## RACF secure signon
+
+TLS protects the network connection. NJE `SIGNON=SECURE` separately authenticates the node with a RACF APPCLU session key. Enable it by passing `sesskey` to the constructor:
+
+```python
+import njelib
+
+nje = njelib.NJE("WASHDC", "NEWYORK", sesskey="PASSWORD")
+nje.setTLS(cafile="certificates/ca.pem", server_hostname="zos.example.com")
+connected = nje.session(host="10.1.1.2", port=2252)
+```
+
+The session key may be up to eight ASCII characters, exactly 16 hexadecimal digits (optionally prefixed with `0x`), or exactly eight raw bytes. Short text keys are uppercased, converted to EBCDIC, and padded with binary zero bytes to match JES2. Secure signon requires either `pycryptodome` or `cryptography` to provide DES.
+
+Configure the same key on z/OS, substituting the local and remote node names and protecting the profile according to your site's policy:
+
+```
+RDEFINE APPCLU NJE.LNODE.RNODE SESSION(SESSKEY(PASSWORD)) UACC(NONE)
+SETROPTS CLASSACT(APPCLU)
+```
+
+The node must also be configured with `SIGNON=SECURE`. A plain NJE password (`password=`) and a secure-signon session key (`sesskey=`) are different settings.
+
+## Submitting identity
+
+`sendJCL()` accepts `userid` and an optional `group`. Both are normalized to uppercase and must be valid 1-8 character RACF names. Leaving `group=None` allows RACF to select or map the propagated user's group rather than asserting the old hard-coded `SYS1` default.
+
+```python
+nje.sendJCL("JCL/id.jcl", userid="PLAGUE", group=None)
+```
+
+These fields assert the submitting identity; they do not authenticate that user or bypass RACF. Configure the receiving node's RACF `NODES` profiles to permit, translate, or reject propagated identities as appropriate.
+
+## Uploading text data sets
+
+`upload_text()` creates and submits a temporary IEBGENER job. It can write an ASCII text file to an existing sequential data set or PDS/PDSE member:
+
+```python
+result = nje.upload_text(
+    "local/config.txt",
+    "PLAGUE.CONFIG(MEMBER)",
+    userid="PLAGUE",
+    long_lines="wrap",
+)
+print(result)
+```
+
+Set `create=True` to allocate a new sequential data set:
+
+```python
+result = nje.upload_text(
+    "local/report.txt",
+    "PLAGUE.REPORT.TEXT",
+    userid="PLAGUE",
+    create=True,
+    recfm="FB",
+    lrecl=80,
+    blksize=0,
+    primary=5,
+    secondary=5,
+    unit="SYSDA",
+)
+```
+
+Only ASCII input and fixed record formats `F` and `FB` are supported, with `LRECL` from 1 through 80. Lines longer than `LRECL` raise an error by default; choose `long_lines="wrap"` or `long_lines="truncate"` to change that behavior. `create=True` supports sequential data sets only. By default the call waits for the complete SYSOUT stream; set `wait_for_sysout=False` to return after submission.
+
 # What's missing?
-Currently there's no support for XMIT (sending/recieving of dataset) but with the current library as is it shouldn't be too hard to implement.
+
+There is still no native XMIT or binary data-set transfer support. `upload_text()` is specifically an ASCII-text upload implemented by submitting an IEBGENER job.
 
 # Credits/Sources:
 To get a LOT more information about NJE than you ever wanted to know you can check out the documentation about the protocol in IBM book **HAS2A620**: **Network Job Entry: Formats and Protocols**. Available Here: http://publibz.boulder.ibm.com/epubs/pdf/has2a620.pdf. I also used the [online documentation](http://www-01.ibm.com/support/knowledgecenter/SSLTBW_2.1.0/com.ibm.zos.v2r1.hasa600/toc.htm) frequently and on top of that sometimes the z/VM documentation was a little  clearer (for example [this entry on NMR headers and contents](http://www-01.ibm.com/support/knowledgecenter/SSB27U_5.4.0/com.ibm.zvm.v54.dmta7/hnmr.htm)).
